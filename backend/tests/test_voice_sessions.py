@@ -71,6 +71,34 @@ async def test_bot_failure_marks_session_as_error() -> None:
     assert manager.active_count == 0
 
 
+async def test_fatal_service_error_marks_session_as_error() -> None:
+    async def deaf_bot(connection: FakeConnection, session: VoiceSession) -> None:
+        session.mark_active()
+        session.record_error("DeepgramSTTService#0: connection error: timeout", fatal=False)
+        session.record_error("DeepgramSTTService#0: Deepgram rejected (status 401)", fatal=True)
+        # The pipeline then ends on its own (ProcessorUnusablePolicy.END).
+
+    manager = VoiceSessionManager(bot_runner=deaf_bot, max_concurrent=1)
+    session = manager.start(FakeConnection("pc-1"))
+    await _settle()
+    assert session.status == "error"
+    assert session.error == "DeepgramSTTService#0: Deepgram rejected (status 401)"
+    assert len(session.errors) == 2
+
+
+async def test_recovered_error_does_not_fail_the_session() -> None:
+    async def flaky_bot(connection: FakeConnection, session: VoiceSession) -> None:
+        session.mark_active()
+        session.record_error("DeepgramSTTService#0: connection error, retrying", fatal=False)
+
+    manager = VoiceSessionManager(bot_runner=flaky_bot, max_concurrent=1)
+    session = manager.start(FakeConnection("pc-1"))
+    await _settle()
+    assert session.status == "ended"
+    assert session.error is None
+    assert session.errors == ["DeepgramSTTService#0: connection error, retrying"]
+
+
 async def test_session_that_never_connects_times_out() -> None:
     async def never_connects(connection: FakeConnection, session: VoiceSession) -> None:
         await asyncio.Event().wait()  # client never shows up

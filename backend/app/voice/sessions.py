@@ -19,6 +19,18 @@ from typing import Literal, Protocol
 from loguru import logger
 
 SessionStatus = Literal["connecting", "active", "ended", "error"]
+TranscriptRole = Literal["user", "assistant"]
+
+MAX_RECORDED_ERRORS = 20
+# Provider errors can embed long header dumps; keep stored messages readable.
+MAX_ERROR_CHARS = 300
+
+
+@dataclass
+class TranscriptEntry:
+    role: TranscriptRole
+    text: str
+    at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 class PeerConnection(Protocol):
@@ -33,14 +45,44 @@ class VoiceSession:
     session_id: str
     started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     connected_at: datetime | None = None
+    # When every service finished setup and the pipeline started (the call is live).
+    ready_at: datetime | None = None
     ended_at: datetime | None = None
     status: SessionStatus = "connecting"
+    # The error that ended (or prevented) the call, if any.
     error: str | None = None
+    # Every error reported during the call, including ones that were recovered from.
+    errors: list[str] = field(default_factory=list)
+    transcript: list[TranscriptEntry] = field(default_factory=list)
+    # Time from VAD end-of-speech to the final transcript, per utterance.
+    stt_latencies_ms: list[float] = field(default_factory=list)
 
     def mark_active(self) -> None:
         if self.status == "connecting":
             self.status = "active"
             self.connected_at = datetime.now(UTC)
+
+    def mark_ready(self) -> None:
+        if self.ready_at is None:
+            self.ready_at = datetime.now(UTC)
+
+    @property
+    def startup_ms(self) -> float | None:
+        """Offer received -> pipeline live (dominated by the STT WebSocket handshake)."""
+        if self.ready_at is None:
+            return None
+        return round((self.ready_at - self.started_at).total_seconds() * 1000, 1)
+
+    def add_transcript(self, role: TranscriptRole, text: str) -> None:
+        self.transcript.append(TranscriptEntry(role=role, text=text))
+
+    def record_error(self, message: str, *, fatal: bool) -> None:
+        if len(message) > MAX_ERROR_CHARS:
+            message = message[: MAX_ERROR_CHARS - 1] + "…"
+        if len(self.errors) < MAX_RECORDED_ERRORS:
+            self.errors.append(message)
+        if fatal and self.error is None:
+            self.error = message
 
     @property
     def duration_seconds(self) -> float | None:
@@ -77,6 +119,10 @@ class VoiceSessionManager:
     def active_count(self) -> int:
         return len(self._active)
 
+    @property
+    def max_concurrent(self) -> int:
+        return self._max_concurrent
+
     def has_capacity(self) -> bool:
         return self.active_count < self._max_concurrent
 
@@ -111,7 +157,8 @@ class VoiceSessionManager:
     async def _run(self, connection: PeerConnection, session: VoiceSession) -> None:
         try:
             await self._bot_runner(connection, session)
-            session.status = "ended"
+            # The pipeline may end on its own after a fatal service error.
+            session.status = "error" if session.error else "ended"
         except asyncio.CancelledError:
             # Cancelled by the connect watchdog (error already set) or by shutdown.
             session.status = "error" if session.error else "ended"

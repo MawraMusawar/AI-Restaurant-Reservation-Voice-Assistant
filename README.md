@@ -12,7 +12,7 @@ A real-time, browser-based AI voice receptionist for restaurants. Callers speak 
 |---|---|
 | 0. Project planning and foundation | ✅ Done |
 | 1. Real-time voice infrastructure (Pipecat + SmallWebRTC) | ✅ Done (verified in Chrome with a simulated microphone) |
-| 2. Deepgram STT | ⬜ Not started |
+| 2. Deepgram STT | ✅ Done (real Deepgram tests + Chrome E2E) |
 | 3. Groq LLM + tool calling | ⬜ Not started |
 | 4. ElevenLabs TTS | ⬜ Not started |
 | 5. Complete conversation engine | ⬜ Not started |
@@ -92,8 +92,8 @@ The health endpoint reports which integrations have credentials configured. It s
 
 ```bash
 cd backend
-uv run pytest                        # all tests (includes a real local WebRTC audio round trip)
-uv run pytest -m "not integration"   # fast unit/API tests only
+uv run pytest                        # all tests (integration tests use a few seconds of Deepgram quota)
+uv run pytest -m "not integration"   # fast unit/API tests only, no external APIs
 uv run ruff check .      # lint
 uv run ruff format .     # format
 ```
@@ -117,21 +117,36 @@ npx tsc --noEmit    # type-check
 npm run build       # production build
 ```
 
-## Live Call (Milestone 1: audio echo test)
+## Live Call (Milestone 2: live transcription)
 
-1. Start the backend and frontend (see below).
-2. Open http://localhost:3000/call, click **Start call**, and allow microphone access.
-3. **Use headphones.** In Milestone 1 the assistant echoes your voice back, which proves two-way WebRTC audio. Deepgram, Groq and ElevenLabs replace the echo in Milestones 2–5.
+1. Set `DEEPGRAM_API_KEY` in `backend/.env`. From South Asia, also set `DEEPGRAM_BASE_URL=api.eu.deepgram.com` (see the measurements below).
+2. Start the backend and frontend (see below).
+3. Open http://localhost:3000/call, wait for **On call**, and speak. Interim words appear in italics and are replaced by final sentences when you pause.
 
-What you should see: the status changes to **On call**, the timer starts, the **You** indicator lights up while you talk, and both level meters move.
+Pipeline: `mic → SmallWebRTC → live-edge gate → Silero VAD → Deepgram (nova-3, streaming) → session recorder`. On end of speech, the VAD triggers a Deepgram *finalize*, so the final transcript doesn't wait for Deepgram's own endpointing.
 
 | Endpoint | Purpose |
 |---|---|
 | `POST /api/offer` | WebRTC offer → SDP answer (starts a voice session) |
 | `PATCH /api/offer` | Trickle ICE candidates |
-| `GET /api/voice/sessions` | Active and recent sessions (in memory until Milestone 6) |
+| `GET /api/voice/status` | Can a call start now? (credentials configured, free line) |
+| `GET /api/voice/sessions` | Active and recent sessions with transcript, startup time, STT latency and errors (in memory until Milestone 6) |
 
-Limits: at most `VOICE_MAX_CONCURRENT_SESSIONS` calls at once (default 2). A browser that never completes the connection is dropped after 30 s, and an idle call ends after 5 minutes.
+Limits: at most `VOICE_MAX_CONCURRENT_SESSIONS` calls at once (default 2). A browser that never completes the connection is dropped after 30 s, and an idle call ends after 5 minutes. If Deepgram rejects the key or quota, the call ends and the error is recorded on the session.
+
+### Measured STT performance (2026-11-06, from Pakistan, real Deepgram)
+
+| Endpoint | Startup (Deepgram WebSocket) | VAD finalize → final transcript | Caller's last word → final transcript |
+|---|---|---|---|
+| US (default) | 1.5–5.9 s, highly variable | 390–1,440 ms | 0.1–4.8 s (fails the 2 s budget about 40% of the time) |
+| **EU (`api.eu.deepgram.com`)** | **0.8–1.4 s** | **110–610 ms** | **≤ 0.53 s** |
+
+Accuracy, test fixtures generated with Windows TTS: normal, fast and slow speech, and speech with white noise at SNR 5 dB, were all transcribed correctly, with only minor errors at fast speed ("Actually" → "Ashley"). Silence produces no transcript.
+
+### Known limitations (STT)
+- **Accents:** only the US-English Windows voices (David, Zira) are available for automated tests. Other accents still need live testing. `DEEPGRAM_LANGUAGE` accepts `en-IN`, `en-GB`, or `multi`.
+- **Speech before "On call" is dropped.** Audio that arrives while Deepgram is still connecting is discarded as stale, so it can't become a lasting delay. Milestone 5's greeting makes the caller wait naturally.
+- **Utterances split at short pauses** (e.g. "...tomorrow evening at" / "seven."). That's fine for display. Milestone 5 adds proper turn detection so the LLM receives whole turns.
 
 ## Running Everything Locally
 

@@ -14,8 +14,11 @@ import { SmallWebRTCTransport } from "@pipecat-ai/small-webrtc-transport";
 import { useCallback, useEffect, useState } from "react";
 
 import { AudioLevelMeter } from "@/components/call/audio-level-meter";
+import { TranscriptPanel } from "@/components/call/transcript-panel";
+import { useCallTranscript } from "@/lib/use-call-transcript";
 import { useTrackAudioLevel } from "@/lib/use-track-audio-level";
 import { describeConnectError, describeDeviceError } from "@/lib/voice-errors";
+import { describeServerError, fetchVoiceStatus } from "@/lib/voice-status";
 
 /** Same-origin signaling endpoint; Next.js proxies it to FastAPI. */
 const OFFER_ENDPOINT = "/api/offer";
@@ -93,7 +96,12 @@ function CallPanel() {
   const isBusy = CONNECTING_STATES.includes(transportState) || transportState === "disconnecting";
   const canStart = !isBusy && !inCall;
 
-  useRTVIClientEvent(RTVIEvent.BotReady, () => setCallStartedAt(Date.now()));
+  const { lines: transcript, reset: resetTranscript } = useCallTranscript();
+
+  useRTVIClientEvent(RTVIEvent.BotReady, () => {
+    resetTranscript();
+    setCallStartedAt(Date.now());
+  });
   useRTVIClientEvent(RTVIEvent.Disconnected, () => {
     setCallStartedAt(null);
     setUserSpeaking(false);
@@ -110,7 +118,8 @@ function CallPanel() {
   );
   useRTVIClientEvent(RTVIEvent.Error, (message) => {
     const data = message.data as { message?: string } | undefined;
-    setError(data?.message ?? "The voice connection reported an error.");
+    console.warn("Voice pipeline error:", data?.message);
+    setError(describeServerError(data?.message));
   });
 
   // Tick the call timer once per second while a call is active.
@@ -124,6 +133,13 @@ function CallPanel() {
     if (!client) return;
     setError(null);
     try {
+      // Fail fast with a clear reason (missing API key, all lines busy) instead of
+      // a failed WebRTC negotiation.
+      const status = await fetchVoiceStatus();
+      if (!status.ready) {
+        setError(status.detail ?? "The voice assistant is not available right now.");
+        return;
+      }
       await client.connect({ webrtcRequestParams: { endpoint: OFFER_ENDPOINT } });
     } catch (err) {
       setError(await describeConnectError(err));
@@ -168,6 +184,8 @@ function CallPanel() {
         <AudioLevelMeter label="Your microphone" level={localLevel} active={inCall && isMicEnabled} tone="caller" />
         <AudioLevelMeter label="Assistant audio" level={remoteLevel} active={inCall} tone="agent" />
       </div>
+
+      <TranscriptPanel lines={transcript} inCall={inCall} />
 
       <dl className="mt-6 grid grid-cols-2 gap-3 text-sm">
         <StatusItem label="Connection" value={transportState} />

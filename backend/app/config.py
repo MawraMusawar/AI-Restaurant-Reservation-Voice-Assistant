@@ -36,6 +36,12 @@ class Settings(BaseSettings):
 
     # --- Speech-to-Text (Milestone 2) ---
     deepgram_api_key: SecretStr | None = None
+    deepgram_model: str = "nova-3-general"
+    # Empty = Deepgram's default (US). "api.eu.deepgram.com" connected ~2x faster
+    # from South Asia in testing (0.7-1.7 s vs 1.8-4.4 s handshake).
+    deepgram_base_url: str = ""
+    # BCP-47 code, e.g. "en", "en-US", "en-IN"; "multi" for multilingual code-switching
+    deepgram_language: str = "en"
 
     # --- LLM (Milestone 3) ---
     groq_api_key: SecretStr | None = None

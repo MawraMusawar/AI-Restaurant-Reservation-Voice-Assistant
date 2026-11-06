@@ -17,8 +17,8 @@ export default function CallPage() {
         </Link>
       </header>
       <p className="text-sm text-zinc-600 dark:text-zinc-400">
-        <strong>Milestone 1 audio test:</strong> the assistant currently echoes your voice back so you
-        can verify two-way audio. Use headphones to avoid feedback.
+        <strong>Milestone 2: live transcription.</strong> Start a call and speak. Your words appear
+        in real time. The assistant starts answering in Milestone 3.
       </p>
       <CallScreen />
     </main>

@@ -1,14 +1,18 @@
-"""Signaling API tests, including a real end-to-end WebRTC audio round trip.
+"""Signaling API tests, plus real end-to-end transcription over WebRTC.
 
-The end-to-end test uses aiortc (installed with pipecat-ai[webrtc]) as a
-stand-in for the browser: it sends a 440 Hz tone and checks that the
-pipeline's audio loopback sends the tone back over WebRTC.
+The end-to-end tests use aiortc (installed with pipecat-ai[webrtc]) in place of
+the browser. They stream speech WAV fixtures to the agent and check what
+Deepgram transcribed. They need DEEPGRAM_API_KEY and use a few seconds of the
+Deepgram free quota per test.
 """
 
 import asyncio
 import fractions
 import time
-from collections.abc import AsyncIterator
+import wave
+from collections.abc import AsyncIterator, Callable
+from datetime import UTC, datetime
+from pathlib import Path
 
 import av
 import httpx
@@ -16,10 +20,11 @@ import numpy as np
 import pytest
 from aiortc import MediaStreamTrack, RTCPeerConnection, RTCSessionDescription
 
+from app.config import Settings, get_settings
 from app.main import create_app
 
-SAMPLE_RATE = 48000
-SAMPLES_PER_FRAME = 960  # 20 ms
+FIXTURES = Path(__file__).parent / "fixtures"
+AUDIO_SDP = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
 
 
 @pytest.fixture
@@ -32,7 +37,7 @@ async def client() -> AsyncIterator[httpx.AsyncClient]:
             yield c
 
 
-# --- Validation ----------------------------------------------------------------
+# --- Validation and readiness ------------------------------------------------------
 
 
 async def test_offer_rejects_missing_sdp(client: httpx.AsyncClient) -> None:
@@ -41,7 +46,7 @@ async def test_offer_rejects_missing_sdp(client: httpx.AsyncClient) -> None:
 
 
 async def test_offer_rejects_non_offer_type(client: httpx.AsyncClient) -> None:
-    response = await client.post("/api/offer", json={"sdp": "v=0", "type": "answer"})
+    response = await client.post("/api/offer", json={"sdp": AUDIO_SDP, "type": "answer"})
     assert response.status_code == 422
 
 
@@ -59,11 +64,43 @@ async def test_offer_without_audio_stream_is_rejected(client: httpx.AsyncClient)
 
 
 async def test_offer_returns_503_when_all_lines_busy(client: httpx.AsyncClient) -> None:
-    sessions = client.app.state.voice.sessions  # type: ignore[attr-defined]
-    sessions._max_concurrent = 0
-    sdp = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
-    response = await client.post("/api/offer", json={"sdp": sdp, "type": "offer"})
+    client.app.dependency_overrides[get_settings] = lambda: Settings(  # type: ignore[attr-defined]
+        _env_file=None, deepgram_api_key="test-key"
+    )
+    client.app.state.voice.sessions._max_concurrent = 0  # type: ignore[attr-defined]
+    response = await client.post("/api/offer", json={"sdp": AUDIO_SDP, "type": "offer"})
     assert response.status_code == 503
+    assert "busy" in response.json()["detail"]
+
+
+async def test_offer_returns_503_when_deepgram_not_configured(client: httpx.AsyncClient) -> None:
+    client.app.dependency_overrides[get_settings] = lambda: Settings(_env_file=None)  # type: ignore[attr-defined]
+    response = await client.post("/api/offer", json={"sdp": AUDIO_SDP, "type": "offer"})
+    assert response.status_code == 503
+    assert "Deepgram" in response.json()["detail"]
+    assert (await client.get("/api/voice/sessions")).json() == []
+
+
+async def test_voice_status_reports_missing_credentials(client: httpx.AsyncClient) -> None:
+    client.app.dependency_overrides[get_settings] = lambda: Settings(_env_file=None)  # type: ignore[attr-defined]
+    body = (await client.get("/api/voice/status")).json()
+    assert body["ready"] is False
+    assert body["missing_credentials"] == ["Deepgram"]
+    assert "Deepgram" in body["detail"]
+
+
+async def test_voice_status_ready_when_configured(client: httpx.AsyncClient) -> None:
+    client.app.dependency_overrides[get_settings] = lambda: Settings(  # type: ignore[attr-defined]
+        _env_file=None, deepgram_api_key="test-key"
+    )
+    body = (await client.get("/api/voice/status")).json()
+    assert body == {
+        "ready": True,
+        "missing_credentials": [],
+        "active_sessions": 0,
+        "max_sessions": 2,
+        "detail": None,
+    }
 
 
 async def test_ice_patch_for_unknown_connection_returns_404(client: httpx.AsyncClient) -> None:
@@ -80,58 +117,89 @@ async def test_sessions_endpoint_starts_empty(client: httpx.AsyncClient) -> None
     assert response.json() == []
 
 
-# --- End-to-end WebRTC audio round trip ------------------------------------------
+# --- End-to-end: speech over WebRTC -> Deepgram -> session transcript ---------------------
 
 
-class ToneTrack(MediaStreamTrack):
-    """A real-time paced 440 Hz sine wave, like a microphone that hums."""
+class WavTrack(MediaStreamTrack):
+    """A microphone that stays silent until `speak` is set, then plays a WAV in real time.
+
+    Like a real caller, it only talks once the call is up. Audio sent before the
+    pipeline is ready is dropped as stale by `LiveEdgeAudioGate`. With
+    `noise_snr_db` set, white noise is mixed in at that signal-to-noise ratio
+    to simulate a noisy room. Trailing silence lets the VAD detect end of speech.
+    `speech_ended_at` records the wall-clock moment the last speech sample was sent.
+    """
 
     kind = "audio"
+    FRAME_MS = 20
 
-    def __init__(self) -> None:
+    def __init__(self, path: Path | None, noise_snr_db: float | None = None) -> None:
         super().__init__()
-        self._pts = 0
+        self.sample_rate = 16000
+        samples = np.zeros(self.sample_rate * 2, dtype=np.float64)
+        if path is not None:
+            with wave.open(str(path), "rb") as w:
+                assert w.getframerate() == 16000 and w.getnchannels() == 1
+                samples = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(
+                    np.float64
+                )
+        if noise_snr_db is not None:
+            rng = np.random.default_rng(seed=42)
+            signal_power = np.mean(samples**2)
+            noise_power = signal_power / (10 ** (noise_snr_db / 10))
+            samples = samples + rng.normal(0, np.sqrt(noise_power), samples.shape)
+        self._audio = np.clip(samples, -32768, 32767).astype(np.int16)
+        self._chunk = self.sample_rate * self.FRAME_MS // 1000
+        self._sent = 0  # samples sent in total (sets the real-time pace)
+        self._speech_pos = 0  # position in the WAV once speaking
         self._start: float | None = None
+        self.speak = asyncio.Event()
+        self.speech_ended_at: datetime | None = None
+
+    @property
+    def duration_secs(self) -> float:
+        return len(self._audio) / self.sample_rate
 
     async def recv(self) -> av.AudioFrame:
         if self._start is None:
             self._start = time.monotonic()
-        delay = self._start + self._pts / SAMPLE_RATE - time.monotonic()
+        delay = self._start + self._sent / self.sample_rate - time.monotonic()
         if delay > 0:
             await asyncio.sleep(delay)
-        t = (np.arange(SAMPLES_PER_FRAME) + self._pts) / SAMPLE_RATE
-        samples = (0.3 * np.sin(2 * np.pi * 440 * t) * 32767).astype(np.int16)
-        frame = av.AudioFrame.from_ndarray(samples.reshape(1, -1), format="s16", layout="mono")
-        frame.sample_rate = SAMPLE_RATE
-        frame.pts = self._pts
-        frame.time_base = fractions.Fraction(1, SAMPLE_RATE)
-        self._pts += SAMPLES_PER_FRAME
+        chunk = np.zeros(self._chunk, dtype=np.int16)
+        if self.speak.is_set() and self._speech_pos < len(self._audio):
+            part = self._audio[self._speech_pos : self._speech_pos + self._chunk]
+            chunk[: len(part)] = part
+            self._speech_pos += self._chunk
+            if self._speech_pos >= len(self._audio):
+                self.speech_ended_at = datetime.now(UTC)
+        frame = av.AudioFrame.from_ndarray(chunk.reshape(1, -1), format="s16", layout="mono")
+        frame.sample_rate = self.sample_rate
+        frame.pts = self._sent
+        frame.time_base = fractions.Fraction(1, self.sample_rate)
+        self._sent += self._chunk
         return frame
 
 
-@pytest.mark.integration
-async def test_webrtc_audio_round_trip(client: httpx.AsyncClient) -> None:
+async def _wait_for_session(
+    client: httpx.AsyncClient, predicate: Callable[[dict], bool], within_secs: float
+) -> dict:
+    deadline = time.monotonic() + within_secs
+    sessions: list = []
+    while time.monotonic() < deadline:
+        sessions = (await client.get("/api/voice/sessions")).json()
+        if sessions and predicate(sessions[0]):
+            return sessions[0]
+        await asyncio.sleep(0.1)
+    raise AssertionError(f"timed out waiting for session state: {sessions}")
+
+
+async def _call_and_get_transcript(
+    client: httpx.AsyncClient, track: WavTrack, wait_after_secs: float = 6.0
+) -> dict:
+    """Place a WebRTC call that plays `track`, hang up, and return the finished session."""
     pc = RTCPeerConnection()
-    pc.addTrack(ToneTrack())
-    echo_heard = asyncio.Event()
-    peak_rms: list[float] = []
-
-    async def listen(track: MediaStreamTrack) -> None:
-        while not echo_heard.is_set():
-            frame = await track.recv()
-            pcm = frame.to_ndarray().astype(np.float64)
-            rms = float(np.sqrt(np.mean(pcm**2)))
-            peak_rms.append(rms)
-            if rms > 1000:  # clearly non-silent: our tone came back
-                echo_heard.set()
-
-    listeners: list[asyncio.Task[None]] = []
-
-    @pc.on("track")
-    def on_track(track: MediaStreamTrack) -> None:
-        if track.kind == "audio":
-            listeners.append(asyncio.create_task(listen(track)))
-
+    pc.addTrack(track)
     try:
         await pc.setLocalDescription(await pc.createOffer())
         response = await client.post(
@@ -139,24 +207,109 @@ async def test_webrtc_audio_round_trip(client: httpx.AsyncClient) -> None:
         )
         assert response.status_code == 200, response.text
         answer = response.json()
-        assert answer["type"] == "answer" and answer["pc_id"]
         await pc.setRemoteDescription(RTCSessionDescription(sdp=answer["sdp"], type="answer"))
-
-        await asyncio.wait_for(echo_heard.wait(), timeout=20)
-
-        sessions = (await client.get("/api/voice/sessions")).json()
-        assert sessions[0]["session_id"] == answer["pc_id"]
-        assert sessions[0]["status"] == "active"
+        # Speak only once the pipeline is live (the browser shows "On call" at this point).
+        await _wait_for_session(client, lambda s: s["ready_at"] is not None, within_secs=20)
+        track.speak.set()
+        # Let the whole clip play, then give Deepgram time to deliver the final result.
+        await asyncio.sleep(track.duration_secs + wait_after_secs)
     finally:
-        for task in listeners:
-            task.cancel()
         await pc.close()
 
-    # Closing the peer connection must end the server-side session.
-    for _ in range(100):
-        sessions = (await client.get("/api/voice/sessions")).json()
-        if sessions and sessions[0]["status"] == "ended":
-            break
-        await asyncio.sleep(0.1)
-    assert sessions[0]["status"] == "ended", sessions
-    assert max(peak_rms) > 1000
+    return await _wait_for_session(
+        client, lambda s: s["status"] in ("ended", "error"), within_secs=10
+    )
+
+
+def _end_of_speech_to_final_ms(session: dict, track: WavTrack) -> float:
+    """Wall-clock time from the caller's last word to the last final transcript."""
+    assert track.speech_ended_at is not None and session["transcript"]
+    last_final = datetime.fromisoformat(session["transcript"][-1]["at"])
+    return (last_final - track.speech_ended_at).total_seconds() * 1000
+
+
+def _text(session: dict) -> str:
+    return " ".join(t["text"] for t in session["transcript"] if t["role"] == "user").lower()
+
+
+needs_deepgram = pytest.mark.skipif(
+    get_settings().deepgram_api_key is None, reason="DEEPGRAM_API_KEY not configured"
+)
+
+
+@pytest.mark.integration
+@needs_deepgram
+@pytest.mark.parametrize(
+    ("fixture", "snr_db", "expected_any"),
+    [
+        ("booking_normal.wav", None, [["table"], ["four", "4"], ["seven", "7"]]),
+        ("correction_fast.wav", None, [["six thirty", "6:30", "630"], ["sarah"]]),
+        ("question_slow.wav", None, [["close"], ["sunday"]]),
+        ("booking_normal.wav", 5.0, [["table"], ["four", "4"]]),  # noisy room, SNR 5 dB
+    ],
+    ids=["normal-speech", "fast-speech", "slow-speech", "background-noise-5dB"],
+)
+async def test_live_transcription_over_webrtc(
+    client: httpx.AsyncClient,
+    fixture: str,
+    snr_db: float | None,
+    expected_any: list[list[str]],
+) -> None:
+    track = WavTrack(FIXTURES / fixture, snr_db)
+    session = await _call_and_get_transcript(client, track)
+    text = _text(session)
+    e2e_ms = _end_of_speech_to_final_ms(session, track)
+    print(
+        f"\n[{fixture} snr={snr_db}] startup_ms={session['startup_ms']} "
+        f"end_of_speech_to_final_ms={e2e_ms:.0f} finalize_ms={session['stt_latencies_ms']}"
+        f"\n  transcript={text!r}"
+    )
+
+    assert session["status"] == "ended", session
+    assert session["error"] is None, session
+    for alternatives in expected_any:
+        assert any(word in text for word in alternatives), (alternatives, text)
+    # Live conversation budget for STT: the final transcript must follow the caller's
+    # last word quickly. This includes the VAD's 0.2 s stop delay and network RTT.
+    assert e2e_ms < 2000, f"final transcript took {e2e_ms:.0f} ms after end of speech"
+
+
+@pytest.mark.integration
+async def test_rejected_deepgram_key_ends_call_with_error(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real Deepgram rejection (invalid key) must end the call and record why."""
+    bad = Settings(_env_file=None, deepgram_api_key="0" * 40)
+    monkeypatch.setattr("app.voice.bot.get_settings", lambda: bad)
+    client.app.dependency_overrides[get_settings] = lambda: bad  # type: ignore[attr-defined]
+
+    pc = RTCPeerConnection()
+    pc.addTrack(WavTrack(None))
+    try:
+        await pc.setLocalDescription(await pc.createOffer())
+        response = await client.post(
+            "/api/offer", json={"sdp": pc.localDescription.sdp, "type": "offer"}
+        )
+        assert response.status_code == 200, response.text
+        answer = response.json()
+        await pc.setRemoteDescription(RTCSessionDescription(sdp=answer["sdp"], type="answer"))
+        # The pipeline must end by itself (ProcessorUnusablePolicy.END), not wait for hang-up.
+        session = await _wait_for_session(
+            client, lambda s: s["status"] in ("ended", "error"), within_secs=20
+        )
+    finally:
+        await pc.close()
+
+    assert session["status"] == "error", session
+    assert "DeepgramSTTService" in session["error"], session
+    assert "401" in session["error"] or "reject" in session["error"].lower(), session
+    assert session["transcript"] == []
+
+
+@pytest.mark.integration
+@needs_deepgram
+async def test_silence_produces_no_transcript(client: httpx.AsyncClient) -> None:
+    session = await _call_and_get_transcript(client, WavTrack(None), wait_after_secs=3.0)
+    assert session["status"] == "ended", session
+    assert session["transcript"] == []
+    assert session["startup_ms"] is not None

@@ -19,7 +19,15 @@ from pipecat.transports.smallwebrtc.request_handler import (
 )
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.voice.sessions import SessionLimitError, SessionStatus, VoiceSessionManager
+from app.config import Settings, get_settings
+from app.services import missing_voice_credentials
+from app.voice.sessions import (
+    SessionLimitError,
+    SessionStatus,
+    TranscriptRole,
+    VoiceSession,
+    VoiceSessionManager,
+)
 
 router = APIRouter(tags=["voice"])
 
@@ -35,8 +43,13 @@ def get_voice_services(request: Request) -> VoiceServices:
 
 
 VoiceDep = Annotated[VoiceServices, Depends(get_voice_services)]
+SettingsDep = Annotated[Settings, Depends(get_settings)]
 
 BUSY_DETAIL = "All voice lines are busy right now. Please try again in a moment."
+
+
+def not_configured_detail(missing: list[str]) -> str:
+    return f"The voice assistant is not configured: missing {', '.join(missing)} API key."
 
 
 # --- Request / response models -------------------------------------------------
@@ -79,22 +92,82 @@ class IcePatchRequest(BaseModel):
     candidates: list[IceCandidateIn] = Field(max_length=100)
 
 
+class TranscriptEntryOut(BaseModel):
+    role: TranscriptRole
+    text: str
+    at: datetime
+
+
 class VoiceSessionOut(BaseModel):
     session_id: str
     status: SessionStatus
     started_at: datetime
     connected_at: datetime | None
+    ready_at: datetime | None
+    startup_ms: float | None
     ended_at: datetime | None
     duration_seconds: float | None
     error: str | None
+    errors: list[str]
+    transcript: list[TranscriptEntryOut]
+    stt_latencies_ms: list[float]
+
+    @classmethod
+    def from_session(cls, s: VoiceSession) -> "VoiceSessionOut":
+        return cls(
+            session_id=s.session_id,
+            status=s.status,
+            started_at=s.started_at,
+            connected_at=s.connected_at,
+            ready_at=s.ready_at,
+            startup_ms=s.startup_ms,
+            ended_at=s.ended_at,
+            duration_seconds=s.duration_seconds,
+            error=s.error,
+            errors=list(s.errors),
+            transcript=[
+                TranscriptEntryOut(role=t.role, text=t.text, at=t.at) for t in s.transcript
+            ],
+            stt_latencies_ms=list(s.stt_latencies_ms),
+        )
+
+
+class VoiceStatusOut(BaseModel):
+    ready: bool
+    missing_credentials: list[str]
+    active_sessions: int
+    max_sessions: int
+    detail: str | None
 
 
 # --- Endpoints ----------------------------------------------------------------
 
 
+@router.get("/voice/status", response_model=VoiceStatusOut)
+async def voice_status(voice: VoiceDep, settings: SettingsDep) -> VoiceStatusOut:
+    """Whether a call can start right now. The call screen checks this before connecting."""
+    missing = missing_voice_credentials(settings)
+    has_capacity = voice.sessions.has_capacity()
+    detail = None
+    if missing:
+        detail = not_configured_detail(missing)
+    elif not has_capacity:
+        detail = BUSY_DETAIL
+    return VoiceStatusOut(
+        ready=not missing and has_capacity,
+        missing_credentials=missing,
+        active_sessions=voice.sessions.active_count,
+        max_sessions=voice.sessions.max_concurrent,
+        detail=detail,
+    )
+
+
 @router.post("/offer", response_model=OfferAnswer)
-async def offer(body: OfferRequest, voice: VoiceDep) -> dict[str, str]:
+async def offer(body: OfferRequest, voice: VoiceDep, settings: SettingsDep) -> dict[str, str]:
     is_new_session = body.pc_id is None or not voice.sessions.is_active(body.pc_id)
+    if is_new_session and (missing := missing_voice_credentials(settings)):
+        logger.warning("Rejected voice session: missing credentials {}", missing)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, not_configured_detail(missing))
     if is_new_session and not voice.sessions.has_capacity():
         logger.warning("Rejected voice session: concurrency limit reached")
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, BUSY_DETAIL)
@@ -155,15 +228,4 @@ async def ice_candidates(body: IcePatchRequest, voice: VoiceDep) -> dict[str, st
 
 @router.get("/voice/sessions", response_model=list[VoiceSessionOut])
 async def list_voice_sessions(voice: VoiceDep) -> list[VoiceSessionOut]:
-    return [
-        VoiceSessionOut(
-            session_id=s.session_id,
-            status=s.status,
-            started_at=s.started_at,
-            connected_at=s.connected_at,
-            ended_at=s.ended_at,
-            duration_seconds=s.duration_seconds,
-            error=s.error,
-        )
-        for s in voice.sessions.list_sessions()
-    ]
+    return [VoiceSessionOut.from_session(s) for s in voice.sessions.list_sessions()]

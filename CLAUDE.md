@@ -52,8 +52,15 @@ Never tell the caller, the UI, or the logs that a reservation was created unless
   - The output transport resamples automatically (input is 16 kHz, output 24 kHz).
   - Bot Started/Stopped Speaking is only emitted for `TTSAudioRawFrame` or `SpeechOutputAudioRawFrame`, **not** for a plain `OutputAudioRawFrame`.
   - With SmallWebRTC the JS client **never emits `RemoteAudioLevel`** (only the WebSocket playback path computes it). Measure the bot's track with `useTrackAudioLevel(usePipecatClientMediaTrack("audio", "bot"))`.
+- Gotchas found in Milestone 2 (verified by measurement):
+  - **A backlog becomes a lasting delay.** Audio queued before the pipeline starts (the STT WebSocket handshake blocks `StartFrame`) gets burst into Deepgram, which answers at about real-time pace. The lag never clears. `LiveEdgeAudioGate` (a token bucket that allows 200 ms bursts) must stay directly after `transport.input()`.
+  - The Deepgram **US** handshake from here takes 1.5–7 s and varies a lot; **EU** (`DEEPGRAM_BASE_URL=api.eu.deepgram.com`) takes 0.7–1.7 s. The cause is the server side, not DNS/IPv6/TLS or the SDK (all ruled out).
+  - Transcripts reach the client as RTVI `user-input` (`RTVIEvent.UserInput`, `input_type === "transcription"`). `user-transcription` / `UserTranscript` are deprecated since 1.13.
+  - `ProcessorUnusablePolicy.END` + the `on_pipeline_error` handler: a rejected key ends the call, with the error recorded on the session.
+  - In `run_test`, VAD/system frames jump ahead of data frames. Use `SleepFrame` to keep real-time ordering.
+  - Integration tests must **speak only after `session.ready_at`**, as a real caller does after "On call". Earlier audio is dropped by the gate.
 - **Test the browser side yourself; don't rely on the user.** Drive the real UI with `playwright-core` + installed Chrome (`C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`) and the flags `--use-fake-ui-for-media-stream --use-fake-device-for-media-stream --use-file-for-fake-audio-capture=<speech.wav>`. Generate the WAV with Windows System.Speech. Keep Playwright in the scratchpad until it's added to the repo in Milestone 8.
-- Voice code lives in `backend/app/voice/`: `router.py` (signaling + validation), `sessions.py` (lifecycle, concurrency cap, 30 s connect watchdog), `bot.py` (pipeline), `processors.py` (Milestone 1 echo + VAD bridge). `run_voice_bot(connection, session)` is the single place where the pipeline is built.
+- Voice code lives in `backend/app/voice/`: `router.py` (signaling, validation, `/voice/status` readiness), `sessions.py` (lifecycle, concurrency cap, 30 s connect watchdog, transcript/latency/errors), `bot.py` (pipeline), `processors.py` (`LiveEdgeAudioGate`, `VADSpeakingBridge`, `SessionRecorder`). Service factories live in `backend/app/services/` (`stt.py`). Add each new service's credential check to `missing_voice_credentials()`. `run_voice_bot(connection, session)` is the single place where the pipeline is built.
 
 ## Repository Layout & Commands
 
