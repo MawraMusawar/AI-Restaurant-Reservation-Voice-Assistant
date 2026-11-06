@@ -42,3 +42,7 @@ def configure_logging(level: str = "INFO", json_output: bool = False) -> None:
         std_logger = logging.getLogger(name)
         std_logger.handlers = [_InterceptHandler()]
         std_logger.propagate = False
+    # The WebRTC ICE/DTLS libraries log every candidate check at INFO, which buries
+    # application logs. Keep only their warnings and errors.
+    for noisy in ("aioice", "aiortc"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)

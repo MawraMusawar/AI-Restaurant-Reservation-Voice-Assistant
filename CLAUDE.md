@@ -43,7 +43,14 @@ Never tell the caller, the UI, or the logs that a reservation was created unless
 - Context: `LLMContext` (`pipecat.processors.aggregators.llm_context`) + `LLMContextAggregatorPair` / `LLMUserAggregatorParams` (`pipecat.processors.aggregators.llm_response_universal`). VAD: `SileroVADAnalyzer` (`pipecat.audio.vad.silero`).
 - RTVI: `PipelineWorker` attaches `RTVIProcessor` and `RTVIObserver` automatically (`worker.rtvi`). Don't add them to the pipeline list yourself.
 - Tools: `FunctionSchema` (`pipecat.adapters.llm.schemas.function_schema`) with `handler=`, or direct functions taking `FunctionCallParams` (`pipecat.services.llm_service`). Return results via `await params.result_callback(...)`.
-- Browser client: `@pipecat-ai/client-js` (`PipecatClient`) + `@pipecat-ai/small-webrtc-transport`. Connect with `connect({ webrtcRequestParams: { endpoint: "/api/offer" } })`. Check npm versions with `npm view` when installing.
+- Browser client: `@pipecat-ai/client-js` (`PipecatClient`) + `@pipecat-ai/small-webrtc-transport`. Connect with `connect({ webrtcRequestParams: { endpoint: "/api/offer" } })`. Check npm versions with `npm view` when installing. Installed: client-js 1.16.0, client-react 1.11.0, small-webrtc-transport 1.11.2.
+- Gotchas found in Milestone 1 (verified in source):
+  - `SmallWebRTCRequestHandler.handle_web_request` **awaits** the connection callback before answering, and **swallows** callback exceptions. The callback must only schedule the bot (`VoiceSessionManager.start`), never run it.
+  - aiortc **accepts malformed SDP** and returns an empty answer. `OfferRequest` validates `v=0` + `m=audio` first.
+  - Without an LLM user aggregator, nothing emits `UserStarted/StoppedSpeakingFrame`, and the JS client ignores raw `vad-user-*` messages. `VADSpeakingBridge` covers this until Milestone 5.
+  - `makeRequest` in client-js rejects with the raw `Response` on non-2xx. Map it with `describeConnectError`.
+  - The output transport resamples automatically (input is 16 kHz, output 24 kHz).
+- Voice code lives in `backend/app/voice/`: `router.py` (signaling + validation), `sessions.py` (lifecycle, concurrency cap, 30 s connect watchdog), `bot.py` (pipeline), `processors.py` (Milestone 1 echo + VAD bridge). `run_voice_bot(connection, session)` is the single place where the pipeline is built.
 
 ## Repository Layout & Commands
 
@@ -64,6 +71,10 @@ supabase/   SQL migrations + seed (Milestone 6)
 |---|---|
 | Dev server | `npm run dev` (http://localhost:3000) |
 | Lint / types / build | `npm run lint` / `npx tsc --noEmit` / `npm run build` |
+| Build while the user's dev server runs | `NEXT_DIST_DIR=.next-verify npm run build` (separate output folder, git-ignored) |
+
+- **The user usually has `npm run dev` and the backend running.** Never build into `.next/` and never `npm install` without telling them first, because it disrupts their dev server. Test servers go on ports 8010/3010, and you must confirm they're stopped afterwards.
+- Browser-only code (Pipecat client and transport) is loaded with `next/dynamic` + `ssr: false` (see `components/call/call-screen.tsx`).
 
 - Frontend is **Next.js 16.4** with Cache Components enabled. Read `frontend/AGENTS.md` and the bundled docs in `frontend/node_modules/next/dist/docs/` before writing Next.js code, because APIs differ from older versions.
 - The browser calls same-origin `/api/*`, which `next.config.ts` rewrites to FastAPI via the server-only `BACKEND_URL`. Keep backend routes under `/api`.

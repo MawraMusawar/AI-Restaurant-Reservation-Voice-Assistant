@@ -1,3 +1,5 @@
+import Link from "next/link";
+
 import { BackendStatus } from "@/components/backend-status";
 
 export default function Home() {
@@ -12,8 +14,14 @@ export default function Home() {
         </h1>
         <p className="mt-3 text-zinc-600 dark:text-zinc-400">
           A real-time voice receptionist that answers questions, checks availability, and books
-          tables. The live call screen and dashboard arrive in later milestones.
+          tables.
         </p>
+        <Link
+          href="/call"
+          className="mt-6 inline-flex rounded-full bg-emerald-600 px-6 py-3 text-sm font-semibold text-white transition hover:bg-emerald-700"
+        >
+          Open live call
+        </Link>
       </header>
       <BackendStatus />
     </main>

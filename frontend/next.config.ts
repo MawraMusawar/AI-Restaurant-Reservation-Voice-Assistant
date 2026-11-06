@@ -5,6 +5,9 @@ import type { NextConfig } from "next";
 const backendUrl = process.env.BACKEND_URL ?? "http://127.0.0.1:8000";
 
 const nextConfig: NextConfig = {
+  // Lets a second build/dev server (e.g. automated verification) use its own output
+  // folder without fighting over `.next/` file locks with your running `npm run dev`.
+  distDir: process.env.NEXT_DIST_DIR || ".next",
   cacheComponents: true,
   partialPrefetching: true,
   turbopack: {

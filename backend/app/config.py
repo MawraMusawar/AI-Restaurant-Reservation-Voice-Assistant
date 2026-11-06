@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     log_level: Literal["TRACE", "DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     log_json: bool = False
 
+    # --- Voice sessions ---
+    # Max simultaneous calls. Kept low to protect free API quotas.
+    voice_max_concurrent_sessions: int = Field(default=2, ge=1, le=20)
+
     # --- Speech-to-Text (Milestone 2) ---
     deepgram_api_key: SecretStr | None = None
 

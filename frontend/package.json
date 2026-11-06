@@ -9,6 +9,9 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@pipecat-ai/client-js": "^1.16.0",
+    "@pipecat-ai/client-react": "^1.11.0",
+    "@pipecat-ai/small-webrtc-transport": "^1.11.2",
     "next": "16.4.5",
     "react": "19.3.0",
     "react-dom": "19.3.0"

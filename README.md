@@ -11,7 +11,7 @@ A real-time, browser-based AI voice receptionist for restaurants. Callers speak 
 | Milestone | Status |
 |---|---|
 | 0. Project planning and foundation | ✅ Done |
-| 1. Real-time voice infrastructure (Pipecat + SmallWebRTC) | ⬜ Not started |
+| 1. Real-time voice infrastructure (Pipecat + SmallWebRTC) | 🟡 Code done and automated tests pass; waiting for manual browser test |
 | 2. Deepgram STT | ⬜ Not started |
 | 3. Groq LLM + tool calling | ⬜ Not started |
 | 4. ElevenLabs TTS | ⬜ Not started |
@@ -92,7 +92,8 @@ The health endpoint reports which integrations have credentials configured. It s
 
 ```bash
 cd backend
-uv run pytest            # tests
+uv run pytest                        # all tests (includes a real local WebRTC audio round trip)
+uv run pytest -m "not integration"   # fast unit/API tests only
 uv run ruff check .      # lint
 uv run ruff format .     # format
 ```
@@ -115,6 +116,22 @@ npm run lint        # ESLint
 npx tsc --noEmit    # type-check
 npm run build       # production build
 ```
+
+## Live Call (Milestone 1: audio echo test)
+
+1. Start the backend and frontend (see below).
+2. Open http://localhost:3000/call, click **Start call**, and allow microphone access.
+3. **Use headphones.** In Milestone 1 the assistant echoes your voice back, which proves two-way WebRTC audio. Deepgram, Groq and ElevenLabs replace the echo in Milestones 2–5.
+
+What you should see: the status changes to **On call**, the timer starts, the **You** indicator lights up while you talk, and both level meters move.
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/offer` | WebRTC offer → SDP answer (starts a voice session) |
+| `PATCH /api/offer` | Trickle ICE candidates |
+| `GET /api/voice/sessions` | Active and recent sessions (in memory until Milestone 6) |
+
+Limits: at most `VOICE_MAX_CONCURRENT_SESSIONS` calls at once (default 2). A browser that never completes the connection is dropped after 30 s, and an idle call ends after 5 minutes.
 
 ## Running Everything Locally
 
@@ -144,3 +161,5 @@ Use two terminals:
 | Port 8000 already in use | Run with `--port 8001` and set `BACKEND_URL=http://127.0.0.1:8001` in `frontend/.env.local`. |
 | Home page says "Backend offline" | Start the backend (terminal 1), then refresh the page. |
 | `node` not found after installing Node.js | Restart VS Code or the terminal so the new PATH is loaded. |
+| `EPERM: operation not permitted, rename ...` (Next.js), ruff/uv "Access is denied" | The drive's permissions let normal users create files but not rename or delete them. Grant yourself Modify on the project folder (no admin needed, since you own it): `icacls "D:\Agentic Voice-AI" /grant "${env:USERNAME}:(OI)(CI)M"`, then restart `npm run dev`. |
+| `WinError 10013` or wrong/old API responses on port 8000 | Another process holds port 8000. Find it with `Get-NetTCPConnection -LocalPort 8000` and stop it with `taskkill /PID <pid> /T /F`. |
