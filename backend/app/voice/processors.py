@@ -10,6 +10,7 @@ from pipecat.frames.frames import (
     LLMTextFrame,
     StartFrame,
     TranscriptionFrame,
+    TTSAudioRawFrame,
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
@@ -36,9 +37,11 @@ class LiveEdgeAudioGate(FrameProcessor):
         self,
         max_burst_secs: float = 0.2,
         clock: Callable[[], float] = time.monotonic,
+        session: VoiceSession | None = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
+        self._session = session
         self._capacity = max_burst_secs
         self._clock = clock
         self._tokens = max_burst_secs
@@ -60,6 +63,11 @@ class LiveEdgeAudioGate(FrameProcessor):
             if self._tokens + 1e-6 < duration:
                 self._dropping_secs += duration
                 self.total_dropped_secs += duration
+                # A startup backlog is expected; drops once the call is live are a problem.
+                if self._session is not None and self._session.ready_at is not None:
+                    self._session.dropped_audio_secs = round(
+                        self._session.dropped_audio_secs + duration, 2
+                    )
                 return
             self._tokens -= duration
             if self._dropping_secs:
@@ -123,41 +131,68 @@ class SessionRecorder(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
-class ResponseLatencyRecorder(FrameProcessor):
-    """Measure the time from the end of the caller's turn to the assistant's first text.
+class TurnClock:
+    """When the caller's latest turn ended. Shared by the reply latency probes.
 
     `mark_user_turn_end()` is called from the user aggregator's
-    `on_user_turn_stopped` event. The next non-empty `LLMTextFrame` closes the
-    measurement, so tool calls made before the reply are included, as the
-    caller experiences them. Place it directly after the LLM service.
+    `on_user_turn_stopped` event. Each turn gets a new number, so each probe
+    measures every turn once.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self.clock = clock
+        self.turn = 0
+        self.ended_at: float | None = None
+
+    def mark_user_turn_end(self) -> None:
+        self.turn += 1
+        self.ended_at = self.clock()
+
+
+class ReplyLatencyProbe(FrameProcessor):
+    """Record the time from the end of the caller's turn to the first reply frame.
+
+    Two probes are used: after the LLM (first non-empty `LLMTextFrame`, i.e.
+    the first word of text) and after the TTS (first `TTSAudioRawFrame`, i.e.
+    the moment the caller starts hearing the reply). Tool calls made before the
+    reply are included, as the caller experiences them. Frames pass unchanged.
     """
 
     def __init__(
-        self, session: VoiceSession, clock: Callable[[], float] = time.monotonic, **kwargs
+        self,
+        turn_clock: TurnClock,
+        latencies_ms: list[float],
+        label: str,
+        matches: Callable[[Frame], bool],
+        **kwargs,
     ) -> None:
         super().__init__(**kwargs)
-        self._session = session
-        self._clock = clock
-        self._turn_ended_at: float | None = None
-
-    def mark_user_turn_end(self) -> None:
-        self._turn_ended_at = self._clock()
+        self._turn_clock = turn_clock
+        self._latencies_ms = latencies_ms
+        self._label = label
+        self._matches = matches
+        self._measured_turn = 0
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
 
+        clock = self._turn_clock
         if (
-            isinstance(frame, LLMTextFrame)
-            and self._turn_ended_at is not None
-            and frame.text.strip()
+            clock.ended_at is not None
+            and clock.turn != self._measured_turn
+            and self._matches(frame)
         ):
-            latency_ms = round((self._clock() - self._turn_ended_at) * 1000, 1)
-            self._turn_ended_at = None
-            self._session.response_latencies_ms.append(latency_ms)
-            logger.info(
-                "Assistant first text | session_id={} response_latency_ms={}",
-                self._session.session_id,
-                latency_ms,
-            )
+            self._measured_turn = clock.turn
+            latency_ms = round((clock.clock() - clock.ended_at) * 1000, 1)
+            self._latencies_ms.append(latency_ms)
+            logger.info("Reply latency | {}_ms={}", self._label, latency_ms)
 
         await self.push_frame(frame, direction)
+
+
+def is_text(frame: Frame) -> bool:
+    return isinstance(frame, LLMTextFrame) and bool(frame.text.strip())
+
+
+def is_audio(frame: Frame) -> bool:
+    return isinstance(frame, TTSAudioRawFrame)

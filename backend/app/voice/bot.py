@@ -1,26 +1,29 @@
 """The Pipecat voice pipeline for one call.
 
-Milestone 3 pipeline (the caller speaks, the assistant replies in text):
+Milestone 4 pipeline (a spoken conversation):
 
     browser mic -> SmallWebRTC input -> live-edge gate (drops stale backlogs)
                 -> Deepgram STT (streaming) -> session recorder (ready, STT latency)
                 -> user aggregator (Silero VAD + smart-turn end-of-turn detection)
                 -> Groq LLM (tool calling, fails over between free models)
-                -> response latency recorder -> SmallWebRTC output
-                -> assistant aggregator (adds replies and tool results to the context)
+                -> text latency probe -> ElevenLabs TTS (streaming WebSocket)
+                -> audio latency probe -> SmallWebRTC output (speaker)
+                -> assistant aggregator (adds what was spoken and tool results to the context)
 
 The user aggregator runs the VAD and sends its speech events upstream too, so
 Deepgram is still asked to finalize the moment the caller stops speaking.
-Transcripts reach the browser through RTVI (`user-input`). Assistant replies
-are sent as RTVI server messages (`assistant-message`) until Milestone 4 adds
-ElevenLabs TTS and speaks them.
-"""
+When the caller starts speaking while the assistant talks, the aggregator
+broadcasts an interruption: the LLM response and TTS audio are cancelled, queued
+audio is dropped, and only the words actually spoken stay in the context.
 
-from typing import Any
+The browser gets RTVI messages: `user-input` (caller transcript), `bot-output`
+(each assistant word as it is spoken), speaking/interruption events, tool
+activity (names only), and `assistant-error` server messages.
+"""
 
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import ErrorFrame
+from pipecat.frames.frames import ErrorFrame, TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker, ProcessorUnusablePolicy
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -48,15 +51,19 @@ from app.agent.tools import ReservationTools
 from app.config import get_settings
 from app.services.llm import create_llm_service
 from app.services.stt import create_stt_service
-from app.voice.processors import LiveEdgeAudioGate, ResponseLatencyRecorder, SessionRecorder
+from app.services.tts import create_tts_service
+from app.voice.processors import (
+    LiveEdgeAudioGate,
+    ReplyLatencyProbe,
+    SessionRecorder,
+    TurnClock,
+    is_audio,
+    is_text,
+)
 from app.voice.sessions import VoiceSession
 
 # End the call if nothing happens (no speech, no transcripts) for this long.
 IDLE_TIMEOUT_SECS = 300
-
-
-def assistant_message(text: str) -> dict[str, Any]:
-    return {"type": "assistant-message", "text": text}
 
 
 async def run_voice_bot(connection: SmallWebRTCConnection, session: VoiceSession) -> None:
@@ -72,6 +79,7 @@ async def run_voice_bot(connection: SmallWebRTCConnection, session: VoiceSession
         ),
     )
     stt = create_stt_service(settings)
+    tts = create_tts_service(settings)
 
     def on_llm_failover(model: str, next_model: str, exc: Exception) -> None:
         session.record_error(
@@ -89,25 +97,25 @@ async def run_voice_bot(connection: SmallWebRTCConnection, session: VoiceSession
         profile, OfflineReservationBackend(), observer=session.record_tool_call
     )
     greeting = build_greeting(profile)
-    context = LLMContext(
-        messages=[{"role": "assistant", "content": greeting}],
-        tools=tools.schema(),
-    )
+    # The greeting enters the context when it is spoken (see on_client_ready).
+    context = LLMContext(messages=[], tools=tools.schema())
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
     )
-    response_latency = ResponseLatencyRecorder(session)
+    turn_clock = TurnClock()
 
     pipeline = Pipeline(
         [
             transport.input(),
-            LiveEdgeAudioGate(),
+            LiveEdgeAudioGate(session=session),
             stt,
             SessionRecorder(session),
             user_aggregator,
             llm,
-            response_latency,
+            ReplyLatencyProbe(turn_clock, session.response_latencies_ms, "text", is_text),
+            tts,
+            ReplyLatencyProbe(turn_clock, session.voice_latencies_ms, "audio", is_audio),
             transport.output(),
             assistant_aggregator,
         ]
@@ -141,31 +149,35 @@ async def run_voice_bot(connection: SmallWebRTCConnection, session: VoiceSession
             source,
             frame.error,
         )
-        if frame.processor is llm and not fatal:
-            # The call continues, but this turn got no answer. Tell the browser why.
-            code = "rate_limited" if frame.category == ErrorCategory.RATE_LIMIT else "llm_error"
-            await worker.rtvi.send_server_message({"type": "assistant-error", "code": code})
+        if not fatal and frame.processor in (llm, tts):
+            # The call continues, but this turn got no (spoken) answer. Tell the browser why.
+            await worker.rtvi.send_server_message(
+                {
+                    "type": "assistant-error",
+                    "code": _error_code(frame, is_llm=frame.processor is llm),
+                }
+            )
 
     @worker.rtvi.event_handler("on_client_ready")
     async def on_client_ready(_rtvi: RTVIProcessor) -> None:
         # Registered after the worker's own handler, so this follows `bot-ready`.
-        session.add_transcript("assistant", greeting)
-        await worker.rtvi.send_server_message(assistant_message(greeting))
+        # Spoken straight away: a fixed greeting needs no LLM request.
+        await worker.queue_frames([TTSSpeakFrame(greeting)])
 
     @user_aggregator.event_handler("on_user_turn_stopped")
     async def on_user_turn_stopped(_aggregator, _strategy, message: UserTurnStoppedMessage) -> None:
         if message.content:
-            response_latency.mark_user_turn_end()
+            turn_clock.mark_user_turn_end()
             session.add_transcript("user", message.content)
             logger.debug("Caller turn: {!r}", message.content)
 
     @assistant_aggregator.event_handler("on_assistant_turn_stopped")
     async def on_assistant_turn_stopped(_aggregator, message: AssistantTurnStoppedMessage) -> None:
+        # With TTS this is what was actually spoken; cut short if the caller interrupted.
         text = message.content.strip()
         if text:
-            session.add_transcript("assistant", text)
-            await worker.rtvi.send_server_message(assistant_message(text))
-            logger.debug("Assistant reply: {!r}", text)
+            session.add_transcript("assistant", text, interrupted=message.interrupted)
+            logger.debug("Assistant said (interrupted={}): {!r}", message.interrupted, text)
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(_transport, _connection) -> None:
@@ -179,3 +191,9 @@ async def run_voice_bot(connection: SmallWebRTCConnection, session: VoiceSession
 
     await runner.add_workers(worker)
     await runner.run()
+
+
+def _error_code(frame: ErrorFrame, *, is_llm: bool) -> str:
+    if is_llm:
+        return "rate_limited" if frame.category == ErrorCategory.RATE_LIMIT else "llm_error"
+    return "tts_quota" if frame.category == ErrorCategory.QUOTA else "tts_error"

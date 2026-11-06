@@ -14,7 +14,7 @@ A real-time, browser-based AI voice receptionist for restaurants. Callers speak 
 | 1. Real-time voice infrastructure (Pipecat + SmallWebRTC) | ✅ Done (verified in Chrome with a simulated microphone) |
 | 2. Deepgram STT | ✅ Done (real Deepgram tests + Chrome E2E) |
 | 3. Groq LLM + tool calling | ✅ Done (real Groq conversation tests + Chrome E2E) |
-| 4. ElevenLabs TTS | ⬜ Not started |
+| 4. ElevenLabs TTS | ✅ Done (spoken replies, barge-in; timing re-check pending, see below) |
 | 5. Complete conversation engine | ⬜ Not started |
 | 6. Supabase database + reservation engine | ⬜ Not started |
 | 7. Frontend dashboard | ⬜ Not started |
@@ -55,7 +55,7 @@ API accounts (all on free tiers; needed in later milestones):
 │   │   ├── logging_setup.py  # Structured logging (loguru, optional JSON)
 │   │   ├── api/           # HTTP routes (health)
 │   │   ├── voice/         # Signaling, session lifecycle, the Pipecat pipeline, processors
-│   │   ├── services/      # One module per provider: stt.py (Deepgram), llm.py (Groq)
+│   │   ├── services/      # One module per provider: stt.py (Deepgram), llm.py (Groq), tts.py (ElevenLabs)
 │   │   └── agent/         # Conversation logic: restaurant profile, booking rules, prompt, tools
 │   ├── tests/
 │   ├── pyproject.toml
@@ -121,13 +121,39 @@ npx tsc --noEmit    # type-check
 npm run build       # production build
 ```
 
-## Live Call (Milestone 3: the assistant understands and replies)
+## Live Call (Milestone 4: a spoken conversation)
 
-1. Set `DEEPGRAM_API_KEY` and `GROQ_API_KEY` in `backend/.env`. From South Asia, also set `DEEPGRAM_BASE_URL=api.eu.deepgram.com` (see the measurements below).
+1. Set `DEEPGRAM_API_KEY`, `GROQ_API_KEY` and `ELEVENLABS_API_KEY` in `backend/.env`. From South Asia, also set `DEEPGRAM_BASE_URL=api.eu.deepgram.com` (see the measurements below).
 2. Start the backend and frontend (see below).
-3. Open http://localhost:3000/call and wait for **On call**. The assistant greets you. Ask for a table or about the restaurant. Your words appear live; the assistant's replies appear as text (it speaks them from Milestone 4). While it works, the status shows *Thinking…* or *Checking availability…*.
+3. Open http://localhost:3000/call and wait for **On call**. The assistant greets you out loud. Ask for a table or about the restaurant, and interrupt it whenever you like. The transcript follows the voice: spoken words are solid and words about to be spoken are faded. A reply you cut off is marked *interrupted* and keeps only what you actually heard. While the assistant works, the status shows *Thinking…* or *Checking availability…*.
 
-Pipeline: `mic → SmallWebRTC → live-edge gate → Deepgram (nova-3, streaming) → user aggregator (Silero VAD + smart-turn end-of-turn model) → Groq LLM (tool calling) → assistant aggregator`. The VAD runs in the user aggregator and sends its events upstream too, so Deepgram is still asked to *finalize* the moment you stop speaking.
+Pipeline: `mic → SmallWebRTC → live-edge gate → Deepgram (nova-3, streaming) → user aggregator (Silero VAD + smart-turn end-of-turn model) → Groq LLM (tool calling) → ElevenLabs TTS (streaming WebSocket) → speaker → assistant aggregator`. The VAD runs in the user aggregator and sends its events upstream too, so Deepgram is still asked to *finalize* the moment you stop speaking.
+
+### Speech output (Milestone 4)
+
+- **Voice:** ElevenLabs premade voice *Sarah* (`EXAVITQu4vr4xnSDxMaL`), model `eleven_flash_v2_5` (lowest latency, 0.5 credits per character). Set `ELEVENLABS_VOICE_ID` to any premade voice in your account.
+- **Streaming:** one WebSocket per call. LLM text streams in as it is generated, and playback starts after the first phrase, not the whole reply.
+- **Greeting:** spoken through the TTS the moment the browser is ready. It uses no LLM request and enters the context only once spoken.
+- **Barge-in:** when the caller starts speaking (0.2 s of voice), the pipeline cancels the LLM response and the TTS context and drops queued audio. The assistant aggregator keeps only the words actually spoken (from ElevenLabs word timestamps), so the AI knows exactly what the caller heard.
+- **Failures:** a rejected ElevenLabs key ends the call with the error recorded. If a reply can't be spoken (e.g. credits used up), the call continues and the page explains why.
+- **Free plan:** 10,000 credits a month ≈ 20,000 characters on Flash. A full demo call (greeting plus ~10 replies) uses about 600–700 credits, so **about 15 full calls a month**. Remaining credits: https://elevenlabs.io/app/usage
+
+Measured (2026-11-06). **Note:** another program kept the CPU at 100% for this whole session; the clean re-run is pending.
+
+| What | Result |
+|---|---|
+| Barge-in: caller's first word → assistant audio stops | 576–935 ms (in the pipeline: interruption → voice stopped in 52 ms) |
+| ElevenLabs: first text → first audio | 0.38–0.55 s |
+| WebSocket handshakes, run in parallel (Deepgram US / EU / ElevenLabs) | 1.8–2.8 s / 1.2–1.6 s / 0.9–1.5 s |
+| Caller's last word → reply heard (Chrome E2E, with one tool call) | 3.3–4.0 s under load; Groq was the largest part (see below) |
+| Groq time to first output, warm (tool call request) | `gpt-oss-120b` median 0.6 s; `qwen3.8-27b` median 0.2 s |
+
+Call health, per session in `GET /api/voice/sessions`:
+- `voice_latencies_ms`: turn end → first audio.
+- `dropped_audio_secs`: caller audio dropped mid-call because the server fell behind.
+- `max_loop_lag_ms` / `loop_stalls`: event-loop stalls over 100 ms.
+
+Under the 100% CPU load these showed stalls of up to 1.5 s and about 1 s of dropped caller audio per utterance, which garbled transcripts. **Run the demo on a machine that isn't busy with other heavy work.**
 
 > **Bookings are not live yet.** Until the database exists (Milestone 6), the reservation tools validate everything (dates, opening hours, party size) but then report that the booking system is offline. The assistant says it can't check or book right now. It never pretends a table is free or booked.
 
@@ -187,7 +213,8 @@ Conversation tests (`tests/test_agent_llm.py`, real Groq, run with the scripted 
 ### Known limitations (LLM)
 - **Turn splitting:** the caller's turn can split at short pauses ("Actually," / "can we change that to 6:30?"), and smart-turn sometimes waits its 3 s fallback when a sentence sounds unfinished. Pipecat cancels a reply in progress when the caller continues. Tuning is Milestone 5.
 - **Free-tier throughput** limits how fast and how many calls can run (see above).
-- **No spoken replies yet** (Milestone 4) and **no real bookings yet** (Milestone 6).
+- **No real bookings yet** (Milestone 6).
+- **Wasted requests on split turns:** a turn split at a pause ("What" / "time do you close on Sunday?") starts an LLM request that the next fragment cancels. This costs quota and adds delay; Milestone 5 addresses it.
 
 ### Measured STT performance (2026-11-06, from Pakistan, real Deepgram)
 
@@ -232,5 +259,7 @@ Use two terminals:
 | Home page says "Backend offline" | Start the backend (terminal 1), then refresh the page. |
 | `node` not found after installing Node.js | Restart VS Code or the terminal so the new PATH is loaded. |
 | `EPERM: operation not permitted, rename ...` (Next.js), ruff/uv "Access is denied" | The drive's permissions let normal users create files but not rename or delete them. Grant yourself Modify on the project folder (no admin needed, since you own it): `icacls "D:\Agentic Voice-AI" /grant "${env:USERNAME}:(OI)(CI)M"`, then restart `npm run dev`. |
+| Transcripts garbled, slow replies, `dropped_audio_secs` > 0 or `loop_stalls` > 0 in `/api/voice/sessions` | The computer's CPU is overloaded (another heavy program), so the real-time audio loop falls behind. Close heavy programs (check Task Manager) and retry. |
+| "The ElevenLabs free voice credits are used up" | The monthly 10,000 credits are spent; they reset monthly. Check https://elevenlabs.io/app/usage |
 | "The assistant reached the Groq free-tier rate limit" | Every free model's per-minute budget is used up. Wait ~30 s. If it keeps happening, the daily budget (200K tokens per model) is spent; it resets within 24 h. Usage: https://console.groq.com/settings/limits |
 | `WinError 10013` or wrong/old API responses on port 8000 | Another process holds port 8000. Find it with `Get-NetTCPConnection -LocalPort 8000` and stop it with `taskkill /PID <pid> /T /F`. |

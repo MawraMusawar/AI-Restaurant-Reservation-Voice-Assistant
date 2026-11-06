@@ -11,6 +11,9 @@ from typing import Literal
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# ElevenLabs premade voice "Sarah - Mature, Reassuring, Confident" (female, American).
+DEFAULT_ELEVENLABS_VOICE_ID = "EXAVITQu4vr4xnSDxMaL"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -55,12 +58,19 @@ class Settings(BaseSettings):
 
     # --- Text-to-Speech (Milestone 4) ---
     elevenlabs_api_key: SecretStr | None = None
-    elevenlabs_voice_id: str | None = None
+    # Empty = DEFAULT_ELEVENLABS_VOICE_ID. Premade voices work on the free plan.
+    elevenlabs_voice_id: str = ""
+    # Flash v2.5: lowest latency, and half the credits per character of v2/v3.
+    elevenlabs_model: str = "eleven_flash_v2_5"
 
     # --- Database (Milestone 6) ---
     supabase_url: str | None = None
     supabase_service_role_key: SecretStr | None = None
     database_url: SecretStr | None = None
+
+    @property
+    def elevenlabs_voice(self) -> str:
+        return self.elevenlabs_voice_id.strip() or DEFAULT_ELEVENLABS_VOICE_ID
 
     @property
     def groq_fallback_model_list(self) -> list[str]:

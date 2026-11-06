@@ -22,6 +22,8 @@ SessionStatus = Literal["connecting", "active", "ended", "error"]
 TranscriptRole = Literal["user", "assistant"]
 
 MAX_RECORDED_ERRORS = 20
+LOOP_LAG_INTERVAL_SECS = 0.05
+LOOP_STALL_MS = 100.0
 # Provider errors can embed long header dumps; keep stored messages readable.
 MAX_ERROR_CHARS = 300
 
@@ -31,6 +33,8 @@ class TranscriptEntry:
     role: TranscriptRole
     text: str
     at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    # Assistant only: the caller cut in, so `text` is just what was spoken.
+    interrupted: bool = False
 
 
 @dataclass
@@ -70,6 +74,16 @@ class VoiceSession:
     # Time from the end of the caller's turn to the assistant's first word of text,
     # per reply (includes turn detection hand-off, tool calls and LLM time-to-first-token).
     response_latencies_ms: list[float] = field(default_factory=list)
+    # Time from the end of the caller's turn to the first audio of the reply,
+    # i.e. when the caller starts hearing it (adds TTS time-to-first-byte).
+    voice_latencies_ms: list[float] = field(default_factory=list)
+    # Caller audio discarded by LiveEdgeAudioGate after the call went live, because it
+    # arrived faster than real time (the server fell behind). Should stay near 0.
+    dropped_audio_secs: float = 0.0
+    # Event-loop health during the call: the worst stall, and how many exceeded 100 ms.
+    # A stalled loop delays audio both ways (and makes LiveEdgeAudioGate drop audio).
+    max_loop_lag_ms: float = 0.0
+    loop_stalls: int = 0
     tool_calls: list[ToolCallRecord] = field(default_factory=list)
 
     def mark_active(self) -> None:
@@ -88,8 +102,8 @@ class VoiceSession:
             return None
         return round((self.ready_at - self.started_at).total_seconds() * 1000, 1)
 
-    def add_transcript(self, role: TranscriptRole, text: str) -> None:
-        self.transcript.append(TranscriptEntry(role=role, text=text))
+    def add_transcript(self, role: TranscriptRole, text: str, *, interrupted: bool = False) -> None:
+        self.transcript.append(TranscriptEntry(role=role, text=text, interrupted=interrupted))
 
     def record_tool_call(self, name: str, result: dict, duration_ms: float) -> None:
         self.tool_calls.append(
@@ -180,6 +194,7 @@ class VoiceSessionManager:
         task.cancel()
 
     async def _run(self, connection: PeerConnection, session: VoiceSession) -> None:
+        lag_monitor = asyncio.create_task(_monitor_loop_lag(session))
         try:
             await self._bot_runner(connection, session)
             # The pipeline may end on its own after a fatal service error.
@@ -193,6 +208,7 @@ class VoiceSessionManager:
             session.error = f"{type(exc).__name__}: {exc}"
             logger.exception("Voice session failed | session_id={}", session.session_id)
         finally:
+            lag_monitor.cancel()
             watchdog = self._watchdogs.pop(session.session_id, None)
             if watchdog:
                 watchdog.cancel()
@@ -201,10 +217,14 @@ class VoiceSessionManager:
             self._tasks.pop(session.session_id, None)
             self._history.appendleft(session)
             logger.info(
-                "Voice session finished | session_id={} status={} duration_s={}",
+                "Voice session finished | session_id={} status={} duration_s={} "
+                "max_loop_lag_ms={} loop_stalls={} dropped_audio_secs={}",
                 session.session_id,
                 session.status,
                 session.duration_seconds,
+                session.max_loop_lag_ms,
+                session.loop_stalls,
+                session.dropped_audio_secs,
             )
 
     def list_sessions(self) -> list[VoiceSession]:
@@ -219,3 +239,19 @@ class VoiceSessionManager:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
             logger.info("Cancelled {} voice session(s) on shutdown", len(tasks))
+
+
+async def _monitor_loop_lag(session: VoiceSession) -> None:
+    """Sample how late the event loop wakes up while the call runs."""
+    loop = asyncio.get_running_loop()
+    while True:
+        started = loop.time()
+        await asyncio.sleep(LOOP_LAG_INTERVAL_SECS)
+        lag_ms = (loop.time() - started - LOOP_LAG_INTERVAL_SECS) * 1000
+        if lag_ms > session.max_loop_lag_ms:
+            session.max_loop_lag_ms = round(lag_ms, 1)
+        if lag_ms > LOOP_STALL_MS:
+            session.loop_stalls += 1
+            logger.warning(
+                "Event loop stalled {:.0f} ms | session_id={}", lag_ms, session.session_id
+            )

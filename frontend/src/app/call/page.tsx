@@ -17,9 +17,9 @@ export default function CallPage() {
         </Link>
       </header>
       <p className="text-sm text-zinc-600 dark:text-zinc-400">
-        <strong>Milestone 3: the assistant understands and replies.</strong> Start a call and ask
-        for a table or about the restaurant. Replies appear as text; the assistant speaks them
-        from Milestone 4. Bookings are connected to the database in Milestone 6.
+        <strong>Milestone 4: a spoken conversation.</strong> Start a call and talk to the
+        receptionist. You can interrupt it at any time. Bookings are connected to the database in
+        Milestone 6.
       </p>
       <CallScreen />
     </main>

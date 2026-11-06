@@ -1,21 +1,12 @@
 /**
- * Server messages the voice agent sends over RTVI (see backend `app/voice/bot.py`).
- *
- * - `assistant-message`: one complete assistant reply (text until Milestone 4 speaks it).
- * - `assistant-error`: the assistant could not answer a turn; the call continues.
+ * `assistant-error` server messages from the voice agent (backend `app/voice/bot.py`):
+ * the assistant could not answer (or speak) a turn, but the call continues.
  */
 
-export type AssistantMessage = { type: "assistant-message"; text: string };
-export type AssistantError = { type: "assistant-error"; code: "rate_limited" | "llm_error" };
-
-export function isAssistantMessage(data: unknown): data is AssistantMessage {
-  return (
-    typeof data === "object" &&
-    data !== null &&
-    (data as { type?: unknown }).type === "assistant-message" &&
-    typeof (data as { text?: unknown }).text === "string"
-  );
-}
+export type AssistantError = {
+  type: "assistant-error";
+  code: "rate_limited" | "llm_error" | "tts_quota" | "tts_error";
+};
 
 export function isAssistantError(data: unknown): data is AssistantError {
   return (
@@ -24,10 +15,16 @@ export function isAssistantError(data: unknown): data is AssistantError {
 }
 
 export function describeAssistantError(error: AssistantError): string {
-  if (error.code === "rate_limited") {
-    return "The assistant reached the Groq free-tier rate limit and couldn't answer. Wait a few seconds, then say that again.";
+  switch (error.code) {
+    case "rate_limited":
+      return "The assistant reached the Groq free-tier rate limit and couldn't answer. Wait a few seconds, then say that again.";
+    case "tts_quota":
+      return "The ElevenLabs free voice credits are used up, so the assistant can't speak. They reset monthly.";
+    case "tts_error":
+      return "The assistant's voice failed for that reply. Please say that again.";
+    default:
+      return "The assistant couldn't answer just now. Please say that again.";
   }
-  return "The assistant couldn't answer just now. Please say that again.";
 }
 
 /** What the assistant is doing while a tool runs, by tool name. */

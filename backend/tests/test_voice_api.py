@@ -13,7 +13,7 @@ import fractions
 import time
 import wave
 from collections.abc import AsyncIterator, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import av
@@ -32,7 +32,11 @@ FIXTURES = Path(__file__).parent / "fixtures"
 AUDIO_SDP = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
 
 
-CONFIGURED = {"deepgram_api_key": "test-key", "groq_api_key": "test-key"}
+CONFIGURED = {
+    "deepgram_api_key": "test-key",
+    "groq_api_key": "test-key",
+    "elevenlabs_api_key": "test-key",
+}
 
 
 class SilentLLM(FrameProcessor):
@@ -107,7 +111,7 @@ async def test_voice_status_reports_missing_credentials(client: httpx.AsyncClien
     client.app.dependency_overrides[get_settings] = lambda: Settings(_env_file=None)  # type: ignore[attr-defined]
     body = (await client.get("/api/voice/status")).json()
     assert body["ready"] is False
-    assert body["missing_credentials"] == ["Deepgram", "Groq"]
+    assert body["missing_credentials"] == ["Deepgram", "Groq", "ElevenLabs"]
     assert "Deepgram" in body["detail"] and "Groq" in body["detail"]
 
 
@@ -181,6 +185,12 @@ class WavTrack(MediaStreamTrack):
     @property
     def duration_secs(self) -> float:
         return len(self._audio) / self.sample_rate
+
+    @property
+    def speech_onset_secs(self) -> float:
+        """Leading silence before the first word (the TTS fixtures start with ~0.1 s)."""
+        loud = np.flatnonzero(np.abs(self._audio.astype(np.int32)) > 1000)
+        return float(loud[0]) / self.sample_rate if loud.size else 0.0
 
     async def recv(self) -> av.AudioFrame:
         if self._start is None:
@@ -290,7 +300,8 @@ async def test_live_transcription_over_webrtc(
     print(
         f"\n[{fixture} snr={snr_db}] startup_ms={session['startup_ms']} "
         f"end_of_speech_to_turn_end_ms={e2e_ms:.0f} finalize_ms={session['stt_latencies_ms']}"
-        f"\n  transcript={text!r}"
+        f"\n  transcript={text!r} dropped_audio_secs={session['dropped_audio_secs']} "
+        f"max_loop_lag_ms={session['max_loop_lag_ms']} loop_stalls={session['loop_stalls']}"
     )
 
     assert session["status"] == "ended", session
@@ -312,7 +323,7 @@ async def test_rejected_deepgram_key_ends_call_with_error(
     client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, silent_llm: None
 ) -> None:
     """A real Deepgram rejection (invalid key) must end the call and record why."""
-    bad = Settings(_env_file=None, deepgram_api_key="0" * 40, groq_api_key="unused")
+    bad = get_settings().model_copy(update={"deepgram_api_key": SecretStr("0" * 40)})
     monkeypatch.setattr("app.voice.bot.get_settings", lambda: bad)
     client.app.dependency_overrides[get_settings] = lambda: bad  # type: ignore[attr-defined]
 
@@ -364,3 +375,186 @@ async def test_rejected_groq_key_ends_call_with_error(
     assert "401" in session["error"] or "invalid" in session["error"].lower(), session
     roles = {t["role"] for t in session["transcript"]}
     assert roles == {"user"}, session  # the caller was heard, but never answered
+
+
+# --- End-to-end with speech output (ElevenLabs): greeting, reply, barge-in -----------------
+
+SPEAKING_RMS = 300  # int16 RMS above this = the assistant is audibly talking
+
+
+class BotAudioMonitor:
+    """Plays the caller's speaker: records the loudness of the assistant's audio over time."""
+
+    def __init__(self) -> None:
+        self.samples: list[tuple[float, float]] = []  # (monotonic time, RMS)
+        self._task: asyncio.Task[None] | None = None
+
+    def attach(self, track: MediaStreamTrack) -> None:
+        self._task = asyncio.create_task(self._consume(track))
+
+    async def _consume(self, track: MediaStreamTrack) -> None:
+        while True:
+            try:
+                frame = await track.recv()
+            except Exception:
+                return
+            pcm = frame.to_ndarray().astype(np.float64)
+            self.samples.append((time.monotonic(), float(np.sqrt(np.mean(pcm**2)))))
+
+    def first_speech_after(self, t: float) -> float | None:
+        return next((at for at, rms in self.samples if at >= t and rms > SPEAKING_RMS), None)
+
+    def silent_from(self, t: float, hold_secs: float = 0.3) -> float | None:
+        """First moment after `t` when the audio stays below the speaking level for `hold_secs`."""
+        quiet_since: float | None = None
+        for at, rms in self.samples:
+            if at < t:
+                continue
+            if rms > SPEAKING_RMS:
+                quiet_since = None
+            elif quiet_since is None:
+                quiet_since = at
+            elif at - quiet_since >= hold_secs:
+                return quiet_since
+        return None
+
+    def stop(self) -> None:
+        if self._task:
+            self._task.cancel()
+
+
+CLIENT_READY = (
+    '{"label": "rtvi-ai", "type": "client-ready", "id": "test-1", '
+    '"data": {"version": "2.3.0", "about": {"library": "aiortc-test"}}}'
+)
+
+
+async def _start_call(client: httpx.AsyncClient, track: WavTrack):
+    """Connect like the browser does: audio both ways, plus the RTVI client-ready message."""
+    pc = RTCPeerConnection()
+    pc.addTrack(track)
+    channel = pc.createDataChannel("rtvi")
+    monitor = BotAudioMonitor()
+    pc.on("track", lambda remote: monitor.attach(remote) if remote.kind == "audio" else None)
+    await pc.setLocalDescription(await pc.createOffer())
+    response = await client.post(
+        "/api/offer", json={"sdp": pc.localDescription.sdp, "type": "offer"}
+    )
+    assert response.status_code == 200, response.text
+    answer = response.json()
+    await pc.setRemoteDescription(RTCSessionDescription(sdp=answer["sdp"], type="answer"))
+    await _wait_for_session(client, lambda s: s["ready_at"] is not None, within_secs=20)
+    for _ in range(50):
+        if channel.readyState == "open":
+            break
+        await asyncio.sleep(0.1)
+    channel.send(CLIENT_READY)  # -> bot-ready, then the spoken greeting
+    return pc, monitor
+
+
+async def _hang_up(client: httpx.AsyncClient, pc: RTCPeerConnection, monitor: BotAudioMonitor):
+    monitor.stop()
+    await pc.close()
+    return await _wait_for_session(
+        client, lambda s: s["status"] in ("ended", "error"), within_secs=10
+    )
+
+
+needs_voice = pytest.mark.skipif(
+    get_settings().elevenlabs_api_key is None or get_settings().deepgram_api_key is None,
+    reason="DEEPGRAM_API_KEY and ELEVENLABS_API_KEY required",
+)
+
+
+@pytest.mark.integration
+@needs_voice
+async def test_caller_interrupts_the_greeting(client: httpx.AsyncClient, silent_llm: None) -> None:
+    """Barge-in: speaking over the assistant stops its audio and keeps only what was said."""
+    track = WavTrack(FIXTURES / "booking_normal.wav")
+    pc, monitor = await _start_call(client, track)
+    try:
+        started = time.monotonic()
+        bot_started = None
+        while bot_started is None and time.monotonic() - started < 10:
+            await asyncio.sleep(0.05)
+            bot_started = monitor.first_speech_after(started)
+        assert bot_started is not None, "the greeting was never heard"
+        greeting_secs = bot_started - started
+        # Talk over the greeting 1.2 s after it starts.
+        await asyncio.sleep(max(0.0, bot_started + 1.2 - time.monotonic()))
+        track.speak.set()
+        caller_started = time.monotonic() + track.speech_onset_secs  # first word
+        first_word_wall = datetime.now() + timedelta(seconds=track.speech_onset_secs)
+        await asyncio.sleep(4)
+        # 0.6 s of quiet: longer than the pauses between the greeting's sentences.
+        bot_silent = monitor.silent_from(caller_started, hold_secs=0.6)
+    finally:
+        session = await _hang_up(client, pc, monitor)
+
+    print("\n[barge-in] loudness per 100 ms from greeting start (caller at *):")
+    print(" ".join(_timeline(monitor, bot_started, caller_started)))
+    assert bot_silent is not None, "the assistant kept talking over the caller"
+    stop_ms = (bot_silent - caller_started) * 1000
+    print(
+        f"\n[barge-in] greeting heard after {greeting_secs:.2f}s; "
+        f"audio stopped {stop_ms:.0f} ms after the caller's first word"
+    )
+    print(f"[barge-in] caller's first word at {first_word_wall:%H:%M:%S.%f} (wall clock)")
+    # VAD needs 0.2 s of speech to start a turn; then the TTS and queued audio are dropped.
+    assert stop_ms < 1000, f"assistant audio stopped {stop_ms:.0f} ms after the caller's first word"
+    greeting = next(t for t in session["transcript"] if t["role"] == "assistant")
+    assert greeting["interrupted"] is True, session["transcript"]
+    # Only what was actually spoken is kept (and goes into the LLM context).
+    full = "Thank you for calling Olive & Ember, this is Sara. How can I help you today?"
+    assert greeting["text"] != full and full.startswith(greeting["text"].rstrip(".,")), greeting
+
+
+@pytest.mark.integration
+@needs_voice
+async def test_assistant_answers_out_loud(client: httpx.AsyncClient) -> None:
+    """Real Deepgram + Groq + ElevenLabs: the caller asks, and hears the answer."""
+    track = WavTrack(FIXTURES / "question_slow.wav")  # "...what time do you close on Sunday?"
+    pc, monitor = await _start_call(client, track)
+    try:
+        # Let the greeting finish, as a polite caller would.
+        started = time.monotonic()
+        await asyncio.sleep(2)
+        greeting_end = monitor.silent_from(started + 1.0, hold_secs=0.8)
+        for _ in range(60):
+            if greeting_end is not None:
+                break
+            await asyncio.sleep(0.25)
+            greeting_end = monitor.silent_from(started + 1.0, hold_secs=0.8)
+        assert greeting_end is not None, "the greeting never finished"
+        track.speak.set()
+        await asyncio.sleep(track.duration_secs + 8)
+        speech_end = time.monotonic() - (datetime.now(UTC) - track.speech_ended_at).total_seconds()
+        reply_heard = monitor.first_speech_after(speech_end)
+    finally:
+        session = await _hang_up(client, pc, monitor)
+
+    roles = [t["role"] for t in session["transcript"]]
+    print(
+        f"\n[spoken reply] voice_latency_ms={session['voice_latencies_ms']} "
+        f"text_latency_ms={session['response_latencies_ms']} transcript={session['transcript']}"
+    )
+    assert session["status"] == "ended" and session["error"] is None, session
+    assert reply_heard is not None, "no spoken reply was heard"
+    heard_ms = (reply_heard - speech_end) * 1000
+    print(f"[spoken reply] caller's last word -> reply heard: {heard_ms:.0f} ms")
+    assert roles[0] == "assistant" and "user" in roles and roles[-1] == "assistant", roles
+    reply = session["transcript"][-1]["text"]
+    assert "9:30" in reply or "21:30" in reply or "nine thirty" in reply.lower(), reply
+    assert session["voice_latencies_ms"], session
+    # Turn end (smart-turn, worst case its 3 s fallback) + LLM + one tool call + TTS first audio.
+    assert heard_ms < 5000, f"reply heard {heard_ms:.0f} ms after the caller's last word"
+
+
+def _timeline(monitor: BotAudioMonitor, start: float, mark: float, secs: float = 9.0) -> list[str]:
+    buckets: list[str] = []
+    for i in range(int(secs * 10)):
+        lo, hi = start + i / 10, start + (i + 1) / 10
+        values = [rms for at, rms in monitor.samples if lo <= at < hi]
+        peak = max(values, default=0)
+        buckets.append(("*" if lo <= mark < hi else "") + str(int(peak // 100)))
+    return buckets

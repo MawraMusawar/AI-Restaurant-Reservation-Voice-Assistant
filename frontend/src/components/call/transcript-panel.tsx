@@ -41,10 +41,30 @@ export function TranscriptPanel({ lines, inCall }: TranscriptPanelProps) {
                 >
                   {line.role === "user" ? "You" : "Assistant"}
                 </span>
-                <span className={line.final ? "" : "italic text-zinc-500 dark:text-zinc-400"}>
-                  {line.text}
-                  {!line.final && "…"}
-                </span>
+                {line.segments ? (
+                  line.segments.map((segment, i) => (
+                    <span key={segment.id}>
+                      {i > 0 && " "}
+                      {segment.spoken}
+                      {segment.pending && (
+                        <span className="text-zinc-400 dark:text-zinc-500">
+                          {segment.spoken ? " " : ""}
+                          {segment.pending}
+                        </span>
+                      )}
+                    </span>
+                  ))
+                ) : (
+                  <span className={line.final ? "" : "italic text-zinc-500 dark:text-zinc-400"}>
+                    {line.text}
+                    {!line.final && "…"}
+                  </span>
+                )}
+                {line.interrupted && (
+                  <span className="ml-2 rounded bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium uppercase text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
+                    interrupted
+                  </span>
+                )}
               </li>
             ))}
           </ul>

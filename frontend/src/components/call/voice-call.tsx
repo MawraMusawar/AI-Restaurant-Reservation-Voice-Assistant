@@ -19,7 +19,6 @@ import {
   describeAssistantError,
   describeToolActivity,
   isAssistantError,
-  isAssistantMessage,
 } from "@/lib/assistant-messages";
 import { useCallTranscript } from "@/lib/use-call-transcript";
 import { useTrackAudioLevel } from "@/lib/use-track-audio-level";
@@ -123,7 +122,10 @@ function CallPanel() {
   });
   useRTVIClientEvent(RTVIEvent.UserStartedSpeaking, () => setUserSpeaking(true));
   useRTVIClientEvent(RTVIEvent.UserStoppedSpeaking, () => setUserSpeaking(false));
-  useRTVIClientEvent(RTVIEvent.BotStartedSpeaking, () => setBotSpeaking(true));
+  useRTVIClientEvent(RTVIEvent.BotStartedSpeaking, () => {
+    setBotSpeaking(true);
+    setNotice(null); // the assistant is answering again
+  });
   useRTVIClientEvent(RTVIEvent.BotStoppedSpeaking, () => setBotSpeaking(false));
   useRTVIClientEvent(RTVIEvent.LocalAudioLevel, (level) => setLocalLevel(level));
   useRTVIClientEvent(RTVIEvent.DeviceError, (deviceError) =>
@@ -138,7 +140,6 @@ function CallPanel() {
   useRTVIClientEvent(RTVIEvent.LLMFunctionCallStopped, () => setToolActivity(null));
   useRTVIClientEvent(RTVIEvent.ServerMessage, (data: unknown) => {
     if (isAssistantError(data)) setNotice(describeAssistantError(data));
-    else if (isAssistantMessage(data)) setNotice(null);
   });
   useRTVIClientEvent(RTVIEvent.Error, (message) => {
     const data = message.data as { message?: string } | undefined;

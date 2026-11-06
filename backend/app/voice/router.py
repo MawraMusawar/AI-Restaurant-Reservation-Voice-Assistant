@@ -96,6 +96,7 @@ class TranscriptEntryOut(BaseModel):
     role: TranscriptRole
     text: str
     at: datetime
+    interrupted: bool
 
 
 class ToolCallOut(BaseModel):
@@ -120,6 +121,10 @@ class VoiceSessionOut(BaseModel):
     transcript: list[TranscriptEntryOut]
     stt_latencies_ms: list[float]
     response_latencies_ms: list[float]
+    voice_latencies_ms: list[float]
+    dropped_audio_secs: float
+    max_loop_lag_ms: float
+    loop_stalls: int
     tool_calls: list[ToolCallOut]
 
     @classmethod
@@ -136,10 +141,15 @@ class VoiceSessionOut(BaseModel):
             error=s.error,
             errors=list(s.errors),
             transcript=[
-                TranscriptEntryOut(role=t.role, text=t.text, at=t.at) for t in s.transcript
+                TranscriptEntryOut(role=t.role, text=t.text, at=t.at, interrupted=t.interrupted)
+                for t in s.transcript
             ],
             stt_latencies_ms=list(s.stt_latencies_ms),
             response_latencies_ms=list(s.response_latencies_ms),
+            voice_latencies_ms=list(s.voice_latencies_ms),
+            dropped_audio_secs=s.dropped_audio_secs,
+            max_loop_lag_ms=s.max_loop_lag_ms,
+            loop_stalls=s.loop_stalls,
             tool_calls=[
                 ToolCallOut(
                     name=c.name,

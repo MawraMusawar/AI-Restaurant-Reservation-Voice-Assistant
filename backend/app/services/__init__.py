@@ -10,15 +10,14 @@ class ServiceNotConfiguredError(RuntimeError):
 
 
 def missing_voice_credentials(settings: Settings) -> list[str]:
-    """Names of the integrations the voice pipeline needs but has no key for.
-
-    Grows as milestones add services (ElevenLabs in Milestone 4).
-    """
+    """Names of the integrations the voice pipeline needs but has no key for."""
     missing: list[str] = []
     if not has_secret(settings.deepgram_api_key):
         missing.append("Deepgram")
     if not has_secret(settings.groq_api_key):
         missing.append("Groq")
+    if not has_secret(settings.elevenlabs_api_key):
+        missing.append("ElevenLabs")
     return missing
 
 

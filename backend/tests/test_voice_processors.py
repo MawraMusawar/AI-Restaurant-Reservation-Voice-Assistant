@@ -3,12 +3,21 @@ from pipecat.frames.frames import (
     InterimTranscriptionFrame,
     LLMTextFrame,
     TranscriptionFrame,
+    TTSAudioRawFrame,
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
+from pipecat.pipeline.pipeline import Pipeline
 from pipecat.tests.utils import SleepFrame, run_test
 
-from app.voice.processors import LiveEdgeAudioGate, ResponseLatencyRecorder, SessionRecorder
+from app.voice.processors import (
+    LiveEdgeAudioGate,
+    ReplyLatencyProbe,
+    SessionRecorder,
+    TurnClock,
+    is_audio,
+    is_text,
+)
 from app.voice.sessions import VoiceSession
 
 FRAME_SECS = 0.02  # 20 ms frames, as delivered by the WebRTC input transport
@@ -111,25 +120,48 @@ async def test_session_recorder_measures_latency_after_end_of_speech() -> None:
     assert 40 <= session.stt_latencies_ms[0] < 1000  # ~the 50 ms gap we inserted
 
 
-async def test_response_latency_runs_from_turn_end_to_first_non_empty_text() -> None:
-    session = VoiceSession(session_id="s1")
-    times = iter([10.0, 10.75])  # turn end, then the first real token
-    recorder = ResponseLatencyRecorder(session, clock=lambda: next(times))
-    recorder.mark_user_turn_end()
-    await run_test(
-        recorder,
-        frames_to_send=[LLMTextFrame(""), LLMTextFrame("Sure,"), LLMTextFrame(" what time?")],
-        expected_down_frames=[LLMTextFrame, LLMTextFrame, LLMTextFrame],
+async def test_reply_probes_measure_first_text_and_first_audio_once_per_turn() -> None:
+    times = iter([10.0, 10.6, 11.1, 20.0, 20.4])
+    turn_clock = TurnClock(clock=lambda: next(times))
+    text_ms: list[float] = []
+    audio_ms: list[float] = []
+    pipeline = Pipeline(
+        [
+            ReplyLatencyProbe(turn_clock, text_ms, "text", is_text),
+            ReplyLatencyProbe(turn_clock, audio_ms, "audio", is_audio),
+        ]
     )
-    assert session.response_latencies_ms == [750.0]
+    turn_clock.mark_user_turn_end()  # t=10.0
+    await run_test(
+        pipeline,
+        frames_to_send=[
+            LLMTextFrame(""),  # empty tokens don't count
+            LLMTextFrame("Sure,"),  # t=10.6 -> 600 ms to first text
+            _tts_audio(),  # t=11.1 -> 1100 ms to first audio
+            LLMTextFrame(" what time?"),
+            _tts_audio(),  # later frames of the same turn are ignored
+        ],
+        expected_down_frames=[
+            LLMTextFrame,
+            LLMTextFrame,
+            TTSAudioRawFrame,
+            LLMTextFrame,
+            TTSAudioRawFrame,
+        ],
+    )
+    assert text_ms == [600.0] and audio_ms == [1100.0]
 
 
-async def test_response_latency_ignores_text_without_a_caller_turn() -> None:
-    # e.g. a reply triggered by the system, not by the caller finishing a turn.
-    session = VoiceSession(session_id="s1")
+async def test_reply_probe_ignores_output_without_a_caller_turn() -> None:
+    # e.g. the greeting, spoken before the caller has said anything.
+    audio_ms: list[float] = []
     await run_test(
-        ResponseLatencyRecorder(session),
-        frames_to_send=[LLMTextFrame("Hello")],
-        expected_down_frames=[LLMTextFrame],
+        ReplyLatencyProbe(TurnClock(), audio_ms, "audio", is_audio),
+        frames_to_send=[_tts_audio()],
+        expected_down_frames=[TTSAudioRawFrame],
     )
-    assert session.response_latencies_ms == []
+    assert audio_ms == []
+
+
+def _tts_audio() -> TTSAudioRawFrame:
+    return TTSAudioRawFrame(audio=b"\x00\x00" * 480, sample_rate=24000, num_channels=1)
