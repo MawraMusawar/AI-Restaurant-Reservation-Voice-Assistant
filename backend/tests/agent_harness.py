@@ -35,6 +35,7 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.utils.errors import ErrorCategory
 from pipecat.workers.runner import WorkerRunner
 
+from app.agent.call_control import end_call_tool
 from app.agent.prompt import build_greeting, build_system_prompt
 from app.agent.reservations import ReservationBackend
 from app.agent.restaurant import DEMO_RESTAURANT
@@ -85,13 +86,14 @@ class TextConversation:
     def __init__(self, settings: Settings, backend: ReservationBackend, now: datetime) -> None:
         self.tool_calls: list[ToolCall] = []
         self.failovers: list[str] = []
+        self.ended = False  # the assistant called end_call
         self._texts: list[str] = []
         self._rate_limited = False
         profile = DEMO_RESTAURANT
         tools = ReservationTools(profile, backend, observer=self._on_tool, clock=lambda: now)
         self.context = LLMContext(
             messages=[{"role": "assistant", "content": build_greeting(profile)}],
-            tools=tools.schema(),
+            tools=tools.schema(extra=[end_call_tool(self._on_end_call)]),
         )
         llm = create_llm_service(
             settings,
@@ -120,6 +122,12 @@ class TextConversation:
             if frame.category == ErrorCategory.RATE_LIMIT:
                 self._rate_limited = True
                 self._watcher.done.set()
+
+    async def _on_end_call(self) -> None:
+        # end_call returns without another LLM run, so this reply is complete.
+        self.ended = True
+        self.tool_calls.append(ToolCall("end_call", {"ok": True}))
+        self._watcher.done.set()
 
     def _on_tool(self, name: str, result: dict[str, Any], _ms: float) -> None:
         self.tool_calls.append(ToolCall(name, result))

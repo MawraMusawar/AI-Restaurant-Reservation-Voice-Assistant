@@ -36,6 +36,22 @@ class Settings(BaseSettings):
     # --- Voice sessions ---
     # Max simultaneous calls. Kept low to protect free API quotas.
     voice_max_concurrent_sessions: int = Field(default=2, ge=1, le=20)
+    # Turn-taking (Milestone 5). Continuous voice needed to start the caller's turn
+    # (and interrupt the assistant): longer ignores coughs and "mm-hmm", shorter
+    # stops the assistant sooner. Pipecat's default is 0.2 s. Measured (separate
+    # processes): 0.2-0.3 s -> barge-in 0.6-0.9 s but a one-word "okay" interrupts;
+    # 0.4 s -> "okay" ignored, barge-in 1.2-1.6 s for "Hi, I ...". Also limits the
+    # assistant interrupting itself when its voice leaks from speakers into the mic.
+    voice_vad_start_secs: float = Field(default=0.4, ge=0.1, le=1.0)
+    # While the assistant speaks, transcribed words that also count as an interruption.
+    voice_barge_in_min_words: int = Field(default=2, ge=1, le=5)
+    # After the caller pauses, how long they may resume and stay in the same turn. The
+    # turn ends when smart-turn judges the sentence complete AND this has passed.
+    # Without it, "Great. That's all. Thanks. Goodbye." became 4 turns and 4 LLM
+    # requests (3 cancelled, each ~2K tokens of the free per-minute budget).
+    voice_turn_end_silence_secs: float = Field(default=0.4, ge=0.0, le=2.0)
+    # Caller silent this long after the assistant spoke -> "Are you still there?"
+    voice_silence_prompt_secs: float = Field(default=8.0, ge=2.0, le=60.0)
 
     # --- Speech-to-Text (Milestone 2) ---
     deepgram_api_key: SecretStr | None = None

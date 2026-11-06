@@ -19,6 +19,14 @@ from typing import Literal, Protocol
 from loguru import logger
 
 SessionStatus = Literal["connecting", "active", "ended", "error"]
+EndReason = Literal[
+    "caller_hung_up",  # the browser left the call
+    "assistant_ended",  # the assistant said goodbye and hung up (end_call tool)
+    "caller_silent",  # no answer to the silence check-ins
+    "connect_timeout",  # the browser never completed the WebRTC connection
+    "error",  # a service failed for good (see `error`)
+    "server_shutdown",
+]
 TranscriptRole = Literal["user", "assistant"]
 
 MAX_RECORDED_ERRORS = 20
@@ -64,6 +72,8 @@ class VoiceSession:
     ready_at: datetime | None = None
     ended_at: datetime | None = None
     status: SessionStatus = "connecting"
+    # Why the call ended (set when it ends).
+    end_reason: EndReason | None = None
     # The error that ended (or prevented) the call, if any.
     error: str | None = None
     # Every error reported during the call, including ones that were recovered from.
@@ -190,6 +200,7 @@ class VoiceSessionManager:
         if session is None or task is None or session.status != "connecting":
             return
         session.error = f"Client did not connect within {self._connect_timeout_secs:g}s"
+        session.end_reason = "connect_timeout"
         logger.warning("Voice session connect timeout | session_id={}", session_id)
         task.cancel()
 
@@ -202,6 +213,8 @@ class VoiceSessionManager:
         except asyncio.CancelledError:
             # Cancelled by the connect watchdog (error already set) or by shutdown.
             session.status = "error" if session.error else "ended"
+            if session.end_reason is None and not session.error:
+                session.end_reason = "server_shutdown"
             raise
         except Exception as exc:
             session.status = "error"
@@ -209,6 +222,10 @@ class VoiceSessionManager:
             logger.exception("Voice session failed | session_id={}", session.session_id)
         finally:
             lag_monitor.cancel()
+            if session.error and session.end_reason in (None, "caller_hung_up"):
+                session.end_reason = "error"
+            elif session.end_reason is None:
+                session.end_reason = "caller_hung_up"
             watchdog = self._watchdogs.pop(session.session_id, None)
             if watchdog:
                 watchdog.cancel()
@@ -217,10 +234,11 @@ class VoiceSessionManager:
             self._tasks.pop(session.session_id, None)
             self._history.appendleft(session)
             logger.info(
-                "Voice session finished | session_id={} status={} duration_s={} "
+                "Voice session finished | session_id={} status={} end_reason={} duration_s={} "
                 "max_loop_lag_ms={} loop_stalls={} dropped_audio_secs={}",
                 session.session_id,
                 session.status,
+                session.end_reason,
                 session.duration_seconds,
                 session.max_loop_lag_ms,
                 session.loop_stalls,

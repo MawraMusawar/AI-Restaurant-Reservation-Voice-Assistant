@@ -17,7 +17,10 @@ $fixtures = @(
     @{ File = "correction_fast.wav"; Voice = "Microsoft Zira Desktop"; Rate = 4;
        Text = "Actually, can we change that to six thirty, under the name Sarah?" },
     @{ File = "question_slow.wav"; Voice = "Microsoft Zira Desktop"; Rate = -4;
-       Text = "What time do you close on Sunday?" }
+       Text = "What time do you close on Sunday?" },
+    # A one-word backchannel: must not interrupt the assistant (Milestone 5).
+    @{ File = "backchannel_okay.wav"; Voice = "Microsoft David Desktop"; Rate = 0;
+       Text = "Okay." }
 )
 
 foreach ($f in $fixtures) {

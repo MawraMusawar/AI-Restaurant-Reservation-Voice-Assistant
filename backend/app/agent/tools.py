@@ -100,73 +100,75 @@ class ReservationTools:
         # tool name -> (staged details, caller turn number when staged)
         self._staged: dict[str, tuple[tuple[Any, ...], int]] = {}
 
-    def schema(self) -> ToolsSchema:
+    def schema(self, extra: list[FunctionSchema] | None = None) -> ToolsSchema:
+        """The reservation tools, plus any `extra` ones (e.g. call control)."""
+        return ToolsSchema(standard_tools=[*self.functions(), *(extra or [])])
+
+    def functions(self) -> list[FunctionSchema]:
         slot = {"date": _DATE, "time": _TIME, "guests": _GUESTS}
-        return ToolsSchema(
-            standard_tools=[
-                FunctionSchema(
-                    name="get_restaurant_info",
-                    description="Address, opening hours, contact details, services and policies.",
-                    properties={},
-                    required=[],
-                    handler=self._wrap(self.get_restaurant_info),
+        return [
+            FunctionSchema(
+                name="get_restaurant_info",
+                description="Address, opening hours, contact details, services and policies.",
+                properties={},
+                required=[],
+                handler=self._wrap(self.get_restaurant_info),
+            ),
+            FunctionSchema(
+                name="check_availability",
+                description="Check if a table is free. Returns alternative times if not.",
+                properties=slot,
+                required=["date", "time", "guests"],
+                handler=self._wrap(self.check_availability),
+            ),
+            FunctionSchema(
+                name="get_available_tables",
+                description="List tables (seats, area) that can seat the party at that time.",
+                properties=slot,
+                required=["date", "time", "guests"],
+                handler=self._wrap(self.get_available_tables),
+            ),
+            FunctionSchema(
+                name="create_reservation",
+                description=(
+                    "Book a table. The first call returns the details to read back; call "
+                    "again with caller_confirmed true once the caller says yes."
                 ),
-                FunctionSchema(
-                    name="check_availability",
-                    description="Check if a table is free. Returns alternative times if not.",
-                    properties=slot,
-                    required=["date", "time", "guests"],
-                    handler=self._wrap(self.check_availability),
+                properties={
+                    "customer_name": {"type": "string"},
+                    "phone": {"type": "string"},
+                    **slot,
+                    "special_requests": {"type": "string"},
+                    "caller_confirmed": _CONFIRMED,
+                },
+                required=["customer_name", "date", "time", "guests"],
+                handler=self._wrap(self.create_reservation),
+            ),
+            FunctionSchema(
+                name="get_reservation",
+                description="Find a booking by reference, or by the name and phone used.",
+                properties={
+                    "booking_reference": {"type": "string"},
+                    "customer_name": {"type": "string"},
+                    "phone": {"type": "string"},
+                },
+                required=[],
+                handler=self._wrap(self.get_reservation),
+            ),
+            FunctionSchema(
+                name="cancel_reservation",
+                description=(
+                    "Cancel a booking. The first call returns the booking to read back; "
+                    "call again with caller_confirmed true once the caller says yes."
                 ),
-                FunctionSchema(
-                    name="get_available_tables",
-                    description="List tables (seats, area) that can seat the party at that time.",
-                    properties=slot,
-                    required=["date", "time", "guests"],
-                    handler=self._wrap(self.get_available_tables),
-                ),
-                FunctionSchema(
-                    name="create_reservation",
-                    description=(
-                        "Book a table. The first call returns the details to read back; call "
-                        "again with caller_confirmed true once the caller says yes."
-                    ),
-                    properties={
-                        "customer_name": {"type": "string"},
-                        "phone": {"type": "string"},
-                        **slot,
-                        "special_requests": {"type": "string"},
-                        "caller_confirmed": _CONFIRMED,
-                    },
-                    required=["customer_name", "date", "time", "guests"],
-                    handler=self._wrap(self.create_reservation),
-                ),
-                FunctionSchema(
-                    name="get_reservation",
-                    description="Find a booking by reference, or by the name and phone used.",
-                    properties={
-                        "booking_reference": {"type": "string"},
-                        "customer_name": {"type": "string"},
-                        "phone": {"type": "string"},
-                    },
-                    required=[],
-                    handler=self._wrap(self.get_reservation),
-                ),
-                FunctionSchema(
-                    name="cancel_reservation",
-                    description=(
-                        "Cancel a booking. The first call returns the booking to read back; "
-                        "call again with caller_confirmed true once the caller says yes."
-                    ),
-                    properties={
-                        "booking_reference": {"type": "string"},
-                        "caller_confirmed": _CONFIRMED,
-                    },
-                    required=["booking_reference"],
-                    handler=self._wrap(self.cancel_reservation),
-                ),
-            ]
-        )
+                properties={
+                    "booking_reference": {"type": "string"},
+                    "caller_confirmed": _CONFIRMED,
+                },
+                required=["booking_reference"],
+                handler=self._wrap(self.cancel_reservation),
+            ),
+        ]
 
     def _wrap(self, handler: Handler) -> Callable[[FunctionCallParams], Any]:
         async def run(params: FunctionCallParams) -> None:

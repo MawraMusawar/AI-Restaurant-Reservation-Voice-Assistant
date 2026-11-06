@@ -14,8 +14,8 @@ A real-time, browser-based AI voice receptionist for restaurants. Callers speak 
 | 1. Real-time voice infrastructure (Pipecat + SmallWebRTC) | ✅ Done (verified in Chrome with a simulated microphone) |
 | 2. Deepgram STT | ✅ Done (real Deepgram tests + Chrome E2E) |
 | 3. Groq LLM + tool calling | ✅ Done (real Groq conversation tests + Chrome E2E) |
-| 4. ElevenLabs TTS | ✅ Done (spoken replies, barge-in; timing re-check pending, see below) |
-| 5. Complete conversation engine | ⬜ Not started |
+| 4. ElevenLabs TTS | ✅ Done (spoken replies, barge-in) |
+| 5. Complete conversation engine | ✅ Done (turn-taking, silence, goodbye, error recovery; Chrome E2E) |
 | 6. Supabase database + reservation engine | ⬜ Not started |
 | 7. Frontend dashboard | ⬜ Not started |
 | 8. Testing and debugging | ⬜ Not started |
@@ -121,11 +121,11 @@ npx tsc --noEmit    # type-check
 npm run build       # production build
 ```
 
-## Live Call (Milestone 4: a spoken conversation)
+## Live Call (Milestone 5: a natural conversation)
 
 1. Set `DEEPGRAM_API_KEY`, `GROQ_API_KEY` and `ELEVENLABS_API_KEY` in `backend/.env`. From South Asia, also set `DEEPGRAM_BASE_URL=api.eu.deepgram.com` (see the measurements below).
 2. Start the backend and frontend (see below).
-3. Open http://localhost:3000/call and wait for **On call**. The assistant greets you out loud. Ask for a table or about the restaurant, and interrupt it whenever you like. The transcript follows the voice: spoken words are solid and words about to be spoken are faded. A reply you cut off is marked *interrupted* and keeps only what you actually heard. While the assistant works, the status shows *Thinking…* or *Checking availability…*.
+3. Open http://localhost:3000/call and wait for **On call**. The assistant greets you out loud. Ask for a table or about the restaurant, interrupt it whenever you like, and say goodbye when you're done: it says goodbye and hangs up. The transcript follows the voice: spoken words are solid and words about to be spoken are faded. A reply you cut off is marked *interrupted* and keeps only what you actually heard. While the assistant works, the status shows *Thinking…* or *Checking availability…*.
 
 Pipeline: `mic → SmallWebRTC → live-edge gate → Deepgram (nova-3, streaming) → user aggregator (Silero VAD + smart-turn end-of-turn model) → Groq LLM (tool calling) → ElevenLabs TTS (streaming WebSocket) → speaker → assistant aggregator`. The VAD runs in the user aggregator and sends its events upstream too, so Deepgram is still asked to *finalize* the moment you stop speaking.
 
@@ -134,18 +134,19 @@ Pipeline: `mic → SmallWebRTC → live-edge gate → Deepgram (nova-3, streamin
 - **Voice:** ElevenLabs premade voice *Sarah* (`EXAVITQu4vr4xnSDxMaL`), model `eleven_flash_v2_5` (lowest latency, 0.5 credits per character). Set `ELEVENLABS_VOICE_ID` to any premade voice in your account.
 - **Streaming:** one WebSocket per call. LLM text streams in as it is generated, and playback starts after the first phrase, not the whole reply.
 - **Greeting:** spoken through the TTS the moment the browser is ready. It uses no LLM request and enters the context only once spoken.
-- **Barge-in:** when the caller starts speaking (0.2 s of voice), the pipeline cancels the LLM response and the TTS context and drops queued audio. The assistant aggregator keeps only the words actually spoken (from ElevenLabs word timestamps), so the AI knows exactly what the caller heard.
+- **Barge-in:** when the caller starts speaking (see *Turn-taking* below), the pipeline cancels the LLM response and the TTS context and drops queued audio. The assistant aggregator keeps only the words actually spoken (from ElevenLabs word timestamps), so the AI knows exactly what the caller heard.
 - **Failures:** a rejected ElevenLabs key ends the call with the error recorded. If a reply can't be spoken (e.g. credits used up), the call continues and the page explains why.
 - **Free plan:** 10,000 credits a month ≈ 20,000 characters on Flash. A full demo call (greeting plus ~10 replies) uses about 600–700 credits, so **about 15 full calls a month**. Remaining credits: https://elevenlabs.io/app/usage
 
-Measured (2026-11-06). **Note:** another program kept the CPU at 100% for this whole session; the clean re-run is pending.
+Measured (2026-11-06, quiet CPU, Deepgram EU):
 
 | What | Result |
 |---|---|
-| Barge-in: caller's first word → assistant audio stops | 576–935 ms (in the pipeline: interruption → voice stopped in 52 ms) |
+| Barge-in: caller's first word → assistant audio stops | 1.15–1.6 s with the 0.4 s VAD start (0.8–0.9 s at 0.2 s); in the pipeline, interruption → voice stopped in 30–50 ms |
 | ElevenLabs: first text → first audio | 0.38–0.55 s |
 | WebSocket handshakes, run in parallel (Deepgram US / EU / ElevenLabs) | 1.8–2.8 s / 1.2–1.6 s / 0.9–1.5 s |
-| Caller's last word → reply heard (Chrome E2E, with one tool call) | 3.3–4.0 s under load; Groq was the largest part (see below) |
+| Caller's turn end → reply heard (Chrome E2E) | 0.9–1.7 s (Groq ~0.4–1.2 s + ElevenLabs ~0.4 s) |
+| Call start → "On call" | 1.6–2.3 s (EU); 3.3–5.5 s with Deepgram US |
 | Groq time to first output, warm (tool call request) | `gpt-oss-120b` median 0.6 s; `qwen3.8-27b` median 0.2 s |
 
 Call health, per session in `GET /api/voice/sessions`:
@@ -153,7 +154,27 @@ Call health, per session in `GET /api/voice/sessions`:
 - `dropped_audio_secs`: caller audio dropped mid-call because the server fell behind.
 - `max_loop_lag_ms` / `loop_stalls`: event-loop stalls over 100 ms.
 
-Under the 100% CPU load these showed stalls of up to 1.5 s and about 1 s of dropped caller audio per utterance, which garbled transcripts. **Run the demo on a machine that isn't busy with other heavy work.**
+On a quiet CPU, mid-call dropped audio is 0–0.1 s. Under 100% CPU load (another program running), stalls reached 1.5 s and about 1 s of caller audio was dropped per utterance, which garbled transcripts and failed 3 speech tests. **Run the demo on a machine that isn't busy with other heavy work.**
+
+### Conversation engine (Milestone 5)
+
+**Turn-taking** (settings in `backend/.env`, measured with server and client in separate processes):
+
+| Setting | Default | Why |
+|---|---|---|
+| `VOICE_VAD_START_SECS` | 0.4 | Continuous voice that starts the caller's turn and interrupts the assistant. At 0.2–0.3 s a one-word "okay" (0.37 s) interrupted it; at 0.4 s it doesn't. Also limits the assistant interrupting itself when its voice leaks from speakers into the mic. Cost: barge-in 1.15–1.6 s when the caller opens with a short word and a pause ("Hi, I..."). Use 0.2 with a headset for faster barge-in. |
+| `VOICE_BARGE_IN_MIN_WORDS` | 2 | While the assistant speaks, 2 transcribed words also interrupt it. Words alone were too slow (2.3 s), so this backs up the VAD. |
+| `VOICE_TURN_END_SILENCE_SECS` | 0.4 | The turn ends only when smart-turn judges the sentence complete **and** the caller has paused this long. Before this, "Great. That's all. Thanks. Goodbye." became 4 turns and 7 LLM runs; now 2 turns and 3 runs, for about +0.1 s of reply time. |
+| `VOICE_SILENCE_PROMPT_SECS` | 8 | Silence after the assistant spoke before it checks in. |
+
+**Behaviour:**
+- **Silence:** after 8 s it asks *"Are you still there?"*. After a second silence it says goodbye and ends the call (`end_reason: caller_silent`).
+- **Goodbye:** the `end_call` tool. The assistant says goodbye and hangs up once the queued speech has played (`assistant_ended`). If the model hangs up without saying anything (seen with the fallback model), the pipeline speaks *"Thank you for calling. Goodbye!"* first, so the line never just goes dead.
+- **Error recovery:** if Groq can't answer a turn (every free model rate-limited), the caller *hears* *"Sorry, I'm having a little trouble on my end. Could you say that again?"*, with no LLM needed.
+- **Ambiguity and corrections:** vague requests ("7 or 8") get a clarifying question, corrections are re-checked, and the assistant never announces a check without doing it in the same reply.
+- **Faster answers:** opening hours are answered from the prompt without a tool call, which saves a full LLM request (about 0.6 s and 2K tokens).
+- **Call logs:** every session records `end_reason` (`caller_hung_up`, `assistant_ended`, `caller_silent`, `connect_timeout`, `error`, `server_shutdown`). The page tells the caller when the assistant ended the call.
+- **Startup:** the first call after a server (re)start used to block 6–9 s while it built models, schemas and TLS clients. The voice stack now warms up in a worker thread at server start (0.8 s), and the VAD and smart-turn models load off the event loop. Each call still has one ~0.3–0.5 s stall during its TLS handshakes (Python's SSL context creation on Windows, ~0.2 s each), before the greeting.
 
 > **Bookings are not live yet.** Until the database exists (Milestone 6), the reservation tools validate everything (dates, opening hours, party size) but then report that the booking system is offline. The assistant says it can't check or book right now. It never pretends a table is free or booked.
 
@@ -211,10 +232,11 @@ Conversation tests (`tests/test_agent_llm.py`, real Groq, run with the scripted 
 - **Honesty:** with the offline backend, never claims a table is available or booked.
 
 ### Known limitations (LLM)
-- **Turn splitting:** the caller's turn can split at short pauses ("Actually," / "can we change that to 6:30?"), and smart-turn sometimes waits its 3 s fallback when a sentence sounds unfinished. Pipecat cancels a reply in progress when the caller continues. Tuning is Milestone 5.
+- **Turn splitting:** much reduced (see `VOICE_TURN_END_SILENCE_SECS`), but pauses longer than 0.4 s between sentences still start a new turn, and smart-turn waits its 3 s fallback when a sentence sounds unfinished.
 - **Free-tier throughput** limits how fast and how many calls can run (see above).
 - **No real bookings yet** (Milestone 6).
-- **Wasted requests on split turns:** a turn split at a pause ("What" / "time do you close on Sunday?") starts an LLM request that the next fragment cancels. This costs quota and adds delay; Milestone 5 addresses it.
+- **Fallback model quality:** `qwen3.8-27b` (used when `gpt-oss-120b` is rate-limited) sometimes hangs up without words or announces a check without doing it. The prompt and code guards cover the cases seen so far.
+- **Barge-in flag:** in about 1 of 8 measured barge-ins the audio stopped but the transcript didn't mark the greeting as interrupted.
 
 ### Measured STT performance (2026-11-06, from Pakistan, real Deepgram)
 

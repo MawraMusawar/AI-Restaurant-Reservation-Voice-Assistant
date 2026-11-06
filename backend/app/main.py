@@ -3,6 +3,7 @@
 Run locally:  uv run uvicorn app.main:app --reload --port 8000
 """
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -13,9 +14,9 @@ from pipecat.transports.smallwebrtc.request_handler import SmallWebRTCRequestHan
 
 from app import __version__
 from app.api.health import router as health_router
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.logging_setup import configure_logging
-from app.voice.bot import run_voice_bot
+from app.voice.bot import run_voice_bot, warm_up_voice_stack
 from app.voice.router import VoiceServices
 from app.voice.router import router as voice_router
 from app.voice.sessions import VoiceSessionManager
@@ -37,12 +38,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         ),
     )
     app.state.voice = voice
+    warm_up = asyncio.create_task(_warm_up(settings))
     try:
         yield
     finally:
         logger.info("Backend shutting down")
+        warm_up.cancel()
         await voice.sessions.shutdown()
         await voice.webrtc.close()
+
+
+async def _warm_up(settings: Settings) -> None:
+    try:
+        await asyncio.to_thread(warm_up_voice_stack, settings)
+    except Exception:
+        # Not fatal: the first call just does this work itself.
+        logger.opt(exception=True).warning("Voice stack warm-up failed")
 
 
 def create_app() -> FastAPI:

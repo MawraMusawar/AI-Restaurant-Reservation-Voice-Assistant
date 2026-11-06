@@ -17,8 +17,10 @@ import { AudioLevelMeter } from "@/components/call/audio-level-meter";
 import { TranscriptPanel } from "@/components/call/transcript-panel";
 import {
   describeAssistantError,
+  describeCallEnding,
   describeToolActivity,
   isAssistantError,
+  isCallEnding,
 } from "@/lib/assistant-messages";
 import { useCallTranscript } from "@/lib/use-call-transcript";
 import { useTrackAudioLevel } from "@/lib/use-track-audio-level";
@@ -94,6 +96,8 @@ function CallPanel() {
   const [toolActivity, setToolActivity] = useState<string | null>(null);
   // Non-fatal problems (e.g. LLM rate limit): the call continues.
   const [notice, setNotice] = useState<string | null>(null);
+  // Why the assistant hung up; kept after the call so the caller sees it.
+  const [endedMessage, setEndedMessage] = useState<string | null>(null);
   const [localLevel, setLocalLevel] = useState(0);
   // RemoteAudioLevel never fires with SmallWebRTC, so measure the bot's track directly.
   const botAudioTrack = usePipecatClientMediaTrack("audio", "bot");
@@ -140,6 +144,7 @@ function CallPanel() {
   useRTVIClientEvent(RTVIEvent.LLMFunctionCallStopped, () => setToolActivity(null));
   useRTVIClientEvent(RTVIEvent.ServerMessage, (data: unknown) => {
     if (isAssistantError(data)) setNotice(describeAssistantError(data));
+    else if (isCallEnding(data)) setEndedMessage(describeCallEnding(data));
   });
   useRTVIClientEvent(RTVIEvent.Error, (message) => {
     const data = message.data as { message?: string } | undefined;
@@ -157,6 +162,7 @@ function CallPanel() {
   const startCall = useCallback(async () => {
     if (!client) return;
     setError(null);
+    setEndedMessage(null);
     try {
       // Fail fast with a clear reason (missing API key, all lines busy) instead of
       // a failed WebRTC negotiation.
@@ -228,6 +234,12 @@ function CallPanel() {
       {notice && (
         <p role="status" className="mt-6 rounded-xl bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:bg-amber-950 dark:text-amber-200">
           {notice}
+        </p>
+      )}
+
+      {endedMessage && !inCall && (
+        <p role="status" className="mt-6 rounded-xl bg-zinc-100 px-4 py-3 text-sm text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300">
+          {endedMessage}
         </p>
       )}
 

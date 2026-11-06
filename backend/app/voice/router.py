@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from app.config import Settings, get_settings
 from app.services import missing_voice_credentials
 from app.voice.sessions import (
+    EndReason,
     SessionLimitError,
     SessionStatus,
     TranscriptRole,
@@ -110,6 +111,7 @@ class ToolCallOut(BaseModel):
 class VoiceSessionOut(BaseModel):
     session_id: str
     status: SessionStatus
+    end_reason: EndReason | None
     started_at: datetime
     connected_at: datetime | None
     ready_at: datetime | None
@@ -132,6 +134,7 @@ class VoiceSessionOut(BaseModel):
         return cls(
             session_id=s.session_id,
             status=s.status,
+            end_reason=s.end_reason,
             started_at=s.started_at,
             connected_at=s.connected_at,
             ready_at=s.ready_at,

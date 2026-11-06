@@ -27,6 +27,21 @@ export function describeAssistantError(error: AssistantError): string {
   }
 }
 
+/** `call-ending`: the assistant is hanging up (after its goodbye has played). */
+export type CallEnding = { type: "call-ending"; reason: "assistant_ended" | "caller_silent" };
+
+export function isCallEnding(data: unknown): data is CallEnding {
+  return (
+    typeof data === "object" && data !== null && (data as { type?: unknown }).type === "call-ending"
+  );
+}
+
+export function describeCallEnding(ending: CallEnding): string {
+  return ending.reason === "caller_silent"
+    ? "The call ended because we didn't hear anything for a while."
+    : "The assistant ended the call. Thanks for calling!";
+}
+
 /** What the assistant is doing while a tool runs, by tool name. */
 const TOOL_ACTIVITY: Record<string, string> = {
   get_restaurant_info: "Looking up restaurant details…",

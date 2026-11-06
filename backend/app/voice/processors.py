@@ -173,6 +173,11 @@ class ReplyLatencyProbe(FrameProcessor):
         self._matches = matches
         self._measured_turn = 0
 
+    @property
+    def replied_to_current_turn(self) -> bool:
+        """Whether a matching frame has passed since the caller's latest turn ended."""
+        return self._measured_turn == self._turn_clock.turn
+
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
 

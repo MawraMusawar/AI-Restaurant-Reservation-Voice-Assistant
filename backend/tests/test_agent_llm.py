@@ -120,6 +120,8 @@ async def test_hours_closed_day_and_honesty_while_booking_system_is_offline() ->
     async with TextConversation(get_settings(), OfflineReservationBackend(), NOW) as conv:
         reply = await conv.say("What time do you close on Sunday?")
         assert "9:30" in reply.text or "21:30" in reply.text, reply
+        # Hours are in the prompt: answered without a tool call (one request, not two).
+        assert _names(reply) == [] and reply.llm_requests == 1, reply
 
         # Closed on Mondays: the agent must say so, not offer a Monday table.
         reply = await conv.say("Can I book Monday at 7 for two people?")
@@ -131,3 +133,19 @@ async def test_hours_closed_day_and_honesty_while_booking_system_is_offline() ->
         text = reply.text.lower()
         assert "booked" not in text.replace("not booked", "") and "is available" not in text, reply
         assert "create_reservation" not in _names(reply)
+
+
+async def test_vague_time_gets_a_clarifying_question() -> None:
+    backend = ScriptedBackend()
+    async with TextConversation(get_settings(), backend, NOW) as conv:
+        reply = await conv.say("Can I get a table for four on Saturday, maybe 7 or 8?")
+        assert "?" in reply.text, reply
+        assert backend.created == [] and "create_reservation" not in _names(reply), reply
+
+
+async def test_goodbye_ends_the_call() -> None:
+    async with TextConversation(get_settings(), ScriptedBackend(), NOW) as conv:
+        reply = await conv.say("No, that's everything. Thanks, bye!")
+        assert conv.ended, f"the assistant did not hang up: {reply}"
+        # If the model hangs up without words, the pipeline speaks FALLBACK_GOODBYE
+        # (tested in test_call_control.py), so the line never just goes dead.

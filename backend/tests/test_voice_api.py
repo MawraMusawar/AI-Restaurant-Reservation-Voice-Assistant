@@ -500,8 +500,17 @@ async def test_caller_interrupts_the_greeting(client: httpx.AsyncClient, silent_
         f"audio stopped {stop_ms:.0f} ms after the caller's first word"
     )
     print(f"[barge-in] caller's first word at {first_word_wall:%H:%M:%S.%f} (wall clock)")
-    # VAD needs 0.2 s of speech to start a turn; then the TTS and queued audio are dropped.
-    assert stop_ms < 1000, f"assistant audio stopped {stop_ms:.0f} ms after the caller's first word"
+    turns = session["transcript"]
+    print(
+        f"[barge-in] dropped_audio_secs={session['dropped_audio_secs']} "
+        f"max_loop_lag_ms={session['max_loop_lag_ms']} stt={session['stt_latencies_ms']} "
+        f"transcript={[(t['role'], t['text'][:30], t['interrupted']) for t in turns]}"
+    )
+    # VAD needs VOICE_VAD_START_SECS (0.4 s) of continuous voice; this fixture opens with
+    # "Hi," and a pause. Measured with server and client in separate processes (as with a
+    # browser): 1.2-1.6 s. In this test the client shares the server's process and CPU, so
+    # the bound is looser; it checks that barge-in works, not the exact timing.
+    assert stop_ms < 2500, f"assistant audio stopped {stop_ms:.0f} ms after the caller's first word"
     greeting = next(t for t in session["transcript"] if t["role"] == "assistant")
     assert greeting["interrupted"] is True, session["transcript"]
     # Only what was actually spoken is kept (and goes into the LLM context).
@@ -558,3 +567,60 @@ def _timeline(monitor: BotAudioMonitor, start: float, mark: float, secs: float =
         peak = max(values, default=0)
         buckets.append(("*" if lo <= mark < hi else "") + str(int(peak // 100)))
     return buckets
+
+
+@pytest.mark.integration
+@needs_voice
+async def test_silent_caller_is_checked_on_then_the_call_ends(
+    client: httpx.AsyncClient, silent_llm: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Silence: "Are you still there?", then a goodbye, then the call ends by itself."""
+    fast = get_settings().model_copy(update={"voice_silence_prompt_secs": 2.0})  # 8 s default
+    monkeypatch.setattr("app.voice.bot.get_settings", lambda: fast)
+    pc, monitor = await _start_call(client, WavTrack(None))
+    try:
+        session = await _wait_for_session(
+            client, lambda s: s["status"] in ("ended", "error"), within_secs=40
+        )
+    finally:
+        monitor.stop()
+        await pc.close()
+
+    assert session["status"] == "ended" and session["end_reason"] == "caller_silent", session
+    # Greeting, check-in and goodbye were all heard: three separate bursts of speech.
+    bursts, last = 0, -1.0
+    for at, rms in monitor.samples:
+        if rms > SPEAKING_RMS:
+            if at - last > 1.0:
+                bursts += 1
+            last = at
+    print(f"\n[silence] speech bursts heard: {bursts}, duration {session['duration_seconds']}s")
+    assert bursts >= 3, f"expected greeting + check-in + goodbye, heard {bursts} burst(s)"
+    said = [t["text"] for t in session["transcript"] if t["role"] == "assistant"]
+    assert any("still there" in t for t in said) and any("Goodbye" in t for t in said), said
+
+
+@pytest.mark.integration
+@needs_voice
+async def test_one_word_backchannel_does_not_interrupt(
+    client: httpx.AsyncClient, silent_llm: None
+) -> None:
+    """ "Okay." while the assistant speaks must not cut it off (needs 2+ words)."""
+    track = WavTrack(FIXTURES / "backchannel_okay.wav")
+    pc, monitor = await _start_call(client, track)
+    try:
+        started = time.monotonic()
+        bot_started = None
+        while bot_started is None and time.monotonic() - started < 10:
+            await asyncio.sleep(0.05)
+            bot_started = monitor.first_speech_after(started)
+        assert bot_started is not None, "the greeting was never heard"
+        await asyncio.sleep(max(0.0, bot_started + 1.0 - time.monotonic()))
+        track.speak.set()
+        await asyncio.sleep(6)
+    finally:
+        session = await _hang_up(client, pc, monitor)
+
+    greeting = next(t for t in session["transcript"] if t["role"] == "assistant")
+    assert greeting["interrupted"] is False, session["transcript"]
+    assert greeting["text"].endswith("How can I help you today?"), greeting
