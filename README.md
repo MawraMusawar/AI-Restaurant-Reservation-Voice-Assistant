@@ -11,7 +11,7 @@ A real-time, browser-based AI voice receptionist for restaurants. Callers speak 
 | Milestone | Status |
 |---|---|
 | 0. Project planning and foundation | ✅ Done |
-| 1. Real-time voice infrastructure (Pipecat + SmallWebRTC) | 🟡 Code done and automated tests pass; waiting for manual browser test |
+| 1. Real-time voice infrastructure (Pipecat + SmallWebRTC) | ✅ Done (verified in Chrome with a simulated microphone) |
 | 2. Deepgram STT | ⬜ Not started |
 | 3. Groq LLM + tool calling | ⬜ Not started |
 | 4. ElevenLabs TTS | ⬜ Not started |

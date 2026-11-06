@@ -18,6 +18,16 @@ export async function describeConnectError(error: unknown): Promise<string> {
   if (error instanceof TypeError) {
     return "Could not reach the voice server. Make sure the backend is running.";
   }
+  // The SmallWebRTC transport reports failed offers as "WebRTC offer rejected with status N".
+  const status = error instanceof Error ? /status (\d{3})/.exec(error.message)?.[1] : undefined;
+  if (status === "503") return "All voice lines are busy. Please try again shortly.";
+  if (status === "404") {
+    return "The voice service was not found (HTTP 404). The backend on BACKEND_URL (default port 8000) is not running the latest code. Restart it.";
+  }
+  if (status === "400" || status === "422") {
+    return "The voice connection could not be negotiated. Please refresh and try again.";
+  }
+  if (status) return `The voice server returned an error (HTTP ${status}).`;
   if (error instanceof Error && error.message) return error.message;
   return "Something went wrong while starting the call.";
 }

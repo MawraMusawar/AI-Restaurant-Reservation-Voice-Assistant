@@ -8,7 +8,7 @@ ElevenLabs TTS replace them in Milestones 2-5.
 from pipecat.frames.frames import (
     Frame,
     InputAudioRawFrame,
-    OutputAudioRawFrame,
+    SpeechOutputAudioRawFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
     VADUserStartedSpeakingFrame,
@@ -20,16 +20,19 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 class AudioLoopback(FrameProcessor):
     """Send the caller's microphone audio straight back to them.
 
-    Turns each `InputAudioRawFrame` into an `OutputAudioRawFrame`. The output
-    transport resamples to its own sample rate when needed. Every other frame
-    passes through unchanged.
+    Turns each `InputAudioRawFrame` into a `SpeechOutputAudioRawFrame`. That
+    subclass matters: the output transport only emits Bot Started/Stopped
+    Speaking for TTS audio or speech-stream audio (using silence detection).
+    A plain `OutputAudioRawFrame` would play, but the UI would never show the
+    assistant as speaking. The output transport resamples when needed. Every
+    other frame passes through unchanged.
     """
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
         if isinstance(frame, InputAudioRawFrame):
             await self.push_frame(
-                OutputAudioRawFrame(
+                SpeechOutputAudioRawFrame(
                     audio=frame.audio,
                     sample_rate=frame.sample_rate,
                     num_channels=frame.num_channels,

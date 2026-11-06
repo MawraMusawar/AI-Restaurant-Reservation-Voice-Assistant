@@ -5,6 +5,7 @@ import {
   PipecatClientAudio,
   PipecatClientProvider,
   usePipecatClient,
+  usePipecatClientMediaTrack,
   usePipecatClientMicControl,
   usePipecatClientTransportState,
   useRTVIClientEvent,
@@ -13,6 +14,7 @@ import { SmallWebRTCTransport } from "@pipecat-ai/small-webrtc-transport";
 import { useCallback, useEffect, useState } from "react";
 
 import { AudioLevelMeter } from "@/components/call/audio-level-meter";
+import { useTrackAudioLevel } from "@/lib/use-track-audio-level";
 import { describeConnectError, describeDeviceError } from "@/lib/voice-errors";
 
 /** Same-origin signaling endpoint; Next.js proxies it to FastAPI. */
@@ -81,7 +83,9 @@ function CallPanel() {
   const [userSpeaking, setUserSpeaking] = useState(false);
   const [botSpeaking, setBotSpeaking] = useState(false);
   const [localLevel, setLocalLevel] = useState(0);
-  const [remoteLevel, setRemoteLevel] = useState(0);
+  // RemoteAudioLevel never fires with SmallWebRTC, so measure the bot's track directly.
+  const botAudioTrack = usePipecatClientMediaTrack("audio", "bot");
+  const remoteLevel = useTrackAudioLevel(botAudioTrack);
   const [callStartedAt, setCallStartedAt] = useState<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
 
@@ -95,14 +99,12 @@ function CallPanel() {
     setUserSpeaking(false);
     setBotSpeaking(false);
     setLocalLevel(0);
-    setRemoteLevel(0);
   });
   useRTVIClientEvent(RTVIEvent.UserStartedSpeaking, () => setUserSpeaking(true));
   useRTVIClientEvent(RTVIEvent.UserStoppedSpeaking, () => setUserSpeaking(false));
   useRTVIClientEvent(RTVIEvent.BotStartedSpeaking, () => setBotSpeaking(true));
   useRTVIClientEvent(RTVIEvent.BotStoppedSpeaking, () => setBotSpeaking(false));
   useRTVIClientEvent(RTVIEvent.LocalAudioLevel, (level) => setLocalLevel(level));
-  useRTVIClientEvent(RTVIEvent.RemoteAudioLevel, (level) => setRemoteLevel(level));
   useRTVIClientEvent(RTVIEvent.DeviceError, (deviceError) =>
     setError(describeDeviceError(deviceError)),
   );

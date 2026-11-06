@@ -1,6 +1,6 @@
 from pipecat.frames.frames import (
     InputAudioRawFrame,
-    OutputAudioRawFrame,
+    SpeechOutputAudioRawFrame,
     TextFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
@@ -17,10 +17,11 @@ async def test_audio_loopback_turns_input_audio_into_output_audio() -> None:
     down, _ = await run_test(
         AudioLoopback(),
         frames_to_send=[InputAudioRawFrame(audio=audio, sample_rate=16000, num_channels=1)],
-        expected_down_frames=[OutputAudioRawFrame],
+        # Must be the speech-stream subclass so the output transport emits bot-speaking events.
+        expected_down_frames=[SpeechOutputAudioRawFrame],
     )
     echoed = down[0]
-    assert isinstance(echoed, OutputAudioRawFrame)
+    assert isinstance(echoed, SpeechOutputAudioRawFrame)
     assert echoed.audio == audio
     assert echoed.sample_rate == 16000
     assert echoed.num_channels == 1

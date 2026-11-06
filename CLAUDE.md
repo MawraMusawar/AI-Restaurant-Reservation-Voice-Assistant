@@ -50,6 +50,9 @@ Never tell the caller, the UI, or the logs that a reservation was created unless
   - Without an LLM user aggregator, nothing emits `UserStarted/StoppedSpeakingFrame`, and the JS client ignores raw `vad-user-*` messages. `VADSpeakingBridge` covers this until Milestone 5.
   - `makeRequest` in client-js rejects with the raw `Response` on non-2xx. Map it with `describeConnectError`.
   - The output transport resamples automatically (input is 16 kHz, output 24 kHz).
+  - Bot Started/Stopped Speaking is only emitted for `TTSAudioRawFrame` or `SpeechOutputAudioRawFrame`, **not** for a plain `OutputAudioRawFrame`.
+  - With SmallWebRTC the JS client **never emits `RemoteAudioLevel`** (only the WebSocket playback path computes it). Measure the bot's track with `useTrackAudioLevel(usePipecatClientMediaTrack("audio", "bot"))`.
+- **Test the browser side yourself; don't rely on the user.** Drive the real UI with `playwright-core` + installed Chrome (`C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`) and the flags `--use-fake-ui-for-media-stream --use-fake-device-for-media-stream --use-file-for-fake-audio-capture=<speech.wav>`. Generate the WAV with Windows System.Speech. Keep Playwright in the scratchpad until it's added to the repo in Milestone 8.
 - Voice code lives in `backend/app/voice/`: `router.py` (signaling + validation), `sessions.py` (lifecycle, concurrency cap, 30 s connect watchdog), `bot.py` (pipeline), `processors.py` (Milestone 1 echo + VAD bridge). `run_voice_bot(connection, session)` is the single place where the pipeline is built.
 
 ## Repository Layout & Commands
