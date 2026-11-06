@@ -60,6 +60,14 @@ supabase/   SQL migrations + seed (Milestone 6)
 | Tests | `uv run pytest` |
 | Lint / format | `uv run ruff check .` / `uv run ruff format .` |
 
+| Task | Command (run in `frontend/`) |
+|---|---|
+| Dev server | `npm run dev` (http://localhost:3000) |
+| Lint / types / build | `npm run lint` / `npx tsc --noEmit` / `npm run build` |
+
+- Frontend is **Next.js 16.4** with Cache Components enabled. Read `frontend/AGENTS.md` and the bundled docs in `frontend/node_modules/next/dist/docs/` before writing Next.js code, because APIs differ from older versions.
+- The browser calls same-origin `/api/*`, which `next.config.ts` rewrites to FastAPI via the server-only `BACKEND_URL`. Keep backend routes under `/api`.
+
 ### Coding standards
 - **Python:** type hints everywhere. Async I/O. Pydantic models for every request and response. Configuration only through `app/config.py` (`Settings`, with secrets as `SecretStr`). Log with `loguru` (`from loguru import logger`), never `print`. Inject FastAPI dependencies with `Annotated[..., Depends(...)]`. Ruff must pass (line length 100).
 - **TypeScript:** strict mode. No secrets in the frontend and no `NEXT_PUBLIC_` API keys.

@@ -10,7 +10,7 @@ A real-time, browser-based AI voice receptionist for restaurants. Callers speak 
 
 | Milestone | Status |
 |---|---|
-| 0. Project planning and foundation | 🟡 In progress: backend done, frontend waiting on Node.js |
+| 0. Project planning and foundation | ✅ Done |
 | 1. Real-time voice infrastructure (Pipecat + SmallWebRTC) | ⬜ Not started |
 | 2. Deepgram STT | ⬜ Not started |
 | 3. Groq LLM + tool calling | ⬜ Not started |
@@ -57,8 +57,14 @@ API accounts (all on free tiers; needed in later milestones):
 │   ├── tests/
 │   ├── pyproject.toml
 │   └── .env.example
-└── frontend/              # Next.js + TypeScript (coming in Milestone 0)
+└── frontend/              # Next.js 16 + React 19 + TypeScript + Tailwind
+    ├── src/app/           # App Router pages
+    ├── src/components/
+    ├── next.config.ts     # proxies /api/* to the FastAPI backend
+    └── .env.example
 ```
+
+The browser only talks to the Next.js origin (`localhost:3000`). Requests to `/api/*` are proxied server-side to FastAPI (`BACKEND_URL`, default `http://127.0.0.1:8000`), so the browser never needs the backend address or any API key.
 
 ---
 
@@ -93,6 +99,34 @@ uv run ruff format .     # format
 
 ---
 
+## Frontend Setup
+
+```bash
+cd frontend
+npm install
+cp .env.example .env.local    # optional; only needed if the backend isn't on 127.0.0.1:8000
+npm run dev                   # http://localhost:3000
+```
+
+With the backend also running, the home page shows **Backend online** and lists which integrations are configured.
+
+```bash
+npm run lint        # ESLint
+npx tsc --noEmit    # type-check
+npm run build       # production build
+```
+
+## Running Everything Locally
+
+Use two terminals:
+
+| Terminal | Command | URL |
+|---|---|---|
+| 1 (backend) | `cd backend && uv run uvicorn app.main:app --reload --port 8000` | http://127.0.0.1:8000/docs |
+| 2 (frontend) | `cd frontend && npm run dev` | http://localhost:3000 |
+
+---
+
 ## Security
 
 - API keys live only in `backend/.env`, which is git-ignored. They are never sent to the browser.
@@ -107,4 +141,6 @@ uv run ruff format .     # format
 |---|---|
 | `requires-python` / Pipecat install error | Use Python 3.12 (`uv python pin 3.12`). Python 3.10 is too old for Pipecat 1.15. |
 | uv warns "Failed to hardlink files" | Harmless on Windows across drives. Set `UV_LINK_MODE=copy` to silence it. |
-| Port 8000 already in use | Run with `--port 8001`, or stop the other process. |
+| Port 8000 already in use | Run with `--port 8001` and set `BACKEND_URL=http://127.0.0.1:8001` in `frontend/.env.local`. |
+| Home page says "Backend offline" | Start the backend (terminal 1), then refresh the page. |
+| `node` not found after installing Node.js | Restart VS Code or the terminal so the new PATH is loaded. |
