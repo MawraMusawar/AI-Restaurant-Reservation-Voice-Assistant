@@ -17,8 +17,9 @@ export default function CallPage() {
         </Link>
       </header>
       <p className="text-sm text-zinc-600 dark:text-zinc-400">
-        <strong>Milestone 2: live transcription.</strong> Start a call and speak. Your words appear
-        in real time. The assistant starts answering in Milestone 3.
+        <strong>Milestone 3: the assistant understands and replies.</strong> Start a call and ask
+        for a table or about the restaurant. Replies appear as text; the assistant speaks them
+        from Milestone 4. Bookings are connected to the database in Milestone 6.
       </p>
       <CallScreen />
     </main>

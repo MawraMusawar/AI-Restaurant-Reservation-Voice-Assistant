@@ -2,8 +2,10 @@
 
 The end-to-end tests use aiortc (installed with pipecat-ai[webrtc]) in place of
 the browser. They stream speech WAV fixtures to the agent and check what
-Deepgram transcribed. They need DEEPGRAM_API_KEY and use a few seconds of the
-Deepgram free quota per test.
+Deepgram transcribed and how the caller's turns were detected. They need
+DEEPGRAM_API_KEY and use a few seconds of the Deepgram free quota per test.
+The LLM is replaced by a stub that never answers, so these tests spend no Groq
+quota (the LLM itself is tested in test_agent_llm.py).
 """
 
 import asyncio
@@ -19,12 +21,32 @@ import httpx
 import numpy as np
 import pytest
 from aiortc import MediaStreamTrack, RTCPeerConnection, RTCSessionDescription
+from pipecat.frames.frames import Frame, LLMContextFrame
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pydantic import SecretStr
 
 from app.config import Settings, get_settings
 from app.main import create_app
 
 FIXTURES = Path(__file__).parent / "fixtures"
 AUDIO_SDP = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+
+
+CONFIGURED = {"deepgram_api_key": "test-key", "groq_api_key": "test-key"}
+
+
+class SilentLLM(FrameProcessor):
+    """Stands in for the LLM: swallows inference requests, passes everything else."""
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if not isinstance(frame, LLMContextFrame):
+            await self.push_frame(frame, direction)
+
+
+@pytest.fixture
+def silent_llm(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.voice.bot.create_llm_service", lambda *_a, **_k: SilentLLM())
 
 
 @pytest.fixture
@@ -65,7 +87,7 @@ async def test_offer_without_audio_stream_is_rejected(client: httpx.AsyncClient)
 
 async def test_offer_returns_503_when_all_lines_busy(client: httpx.AsyncClient) -> None:
     client.app.dependency_overrides[get_settings] = lambda: Settings(  # type: ignore[attr-defined]
-        _env_file=None, deepgram_api_key="test-key"
+        _env_file=None, **CONFIGURED
     )
     client.app.state.voice.sessions._max_concurrent = 0  # type: ignore[attr-defined]
     response = await client.post("/api/offer", json={"sdp": AUDIO_SDP, "type": "offer"})
@@ -85,13 +107,13 @@ async def test_voice_status_reports_missing_credentials(client: httpx.AsyncClien
     client.app.dependency_overrides[get_settings] = lambda: Settings(_env_file=None)  # type: ignore[attr-defined]
     body = (await client.get("/api/voice/status")).json()
     assert body["ready"] is False
-    assert body["missing_credentials"] == ["Deepgram"]
-    assert "Deepgram" in body["detail"]
+    assert body["missing_credentials"] == ["Deepgram", "Groq"]
+    assert "Deepgram" in body["detail"] and "Groq" in body["detail"]
 
 
 async def test_voice_status_ready_when_configured(client: httpx.AsyncClient) -> None:
     client.app.dependency_overrides[get_settings] = lambda: Settings(  # type: ignore[attr-defined]
-        _env_file=None, deepgram_api_key="test-key"
+        _env_file=None, **CONFIGURED
     )
     body = (await client.get("/api/voice/status")).json()
     assert body == {
@@ -117,7 +139,7 @@ async def test_sessions_endpoint_starts_empty(client: httpx.AsyncClient) -> None
     assert response.json() == []
 
 
-# --- End-to-end: speech over WebRTC -> Deepgram -> session transcript ---------------------
+# --- End-to-end: speech over WebRTC -> Deepgram -> caller turns ---------------------------
 
 
 class WavTrack(MediaStreamTrack):
@@ -221,11 +243,16 @@ async def _call_and_get_transcript(
     )
 
 
-def _end_of_speech_to_final_ms(session: dict, track: WavTrack) -> float:
-    """Wall-clock time from the caller's last word to the last final transcript."""
-    assert track.speech_ended_at is not None and session["transcript"]
-    last_final = datetime.fromisoformat(session["transcript"][-1]["at"])
-    return (last_final - track.speech_ended_at).total_seconds() * 1000
+def _end_of_speech_to_turn_end_ms(session: dict, track: WavTrack) -> float:
+    """Wall-clock time from the caller's last word to the end of their turn.
+
+    That is when the LLM receives the caller's words: the VAD stop delay,
+    Deepgram finalize, and smart-turn end-of-turn detection are all included.
+    """
+    user = [t for t in session["transcript"] if t["role"] == "user"]
+    assert track.speech_ended_at is not None and user
+    turn_end = datetime.fromisoformat(user[-1]["at"])
+    return (turn_end - track.speech_ended_at).total_seconds() * 1000
 
 
 def _text(session: dict) -> str:
@@ -251,6 +278,7 @@ needs_deepgram = pytest.mark.skipif(
 )
 async def test_live_transcription_over_webrtc(
     client: httpx.AsyncClient,
+    silent_llm: None,
     fixture: str,
     snr_db: float | None,
     expected_any: list[list[str]],
@@ -258,10 +286,10 @@ async def test_live_transcription_over_webrtc(
     track = WavTrack(FIXTURES / fixture, snr_db)
     session = await _call_and_get_transcript(client, track)
     text = _text(session)
-    e2e_ms = _end_of_speech_to_final_ms(session, track)
+    e2e_ms = _end_of_speech_to_turn_end_ms(session, track)
     print(
         f"\n[{fixture} snr={snr_db}] startup_ms={session['startup_ms']} "
-        f"end_of_speech_to_final_ms={e2e_ms:.0f} finalize_ms={session['stt_latencies_ms']}"
+        f"end_of_speech_to_turn_end_ms={e2e_ms:.0f} finalize_ms={session['stt_latencies_ms']}"
         f"\n  transcript={text!r}"
     )
 
@@ -269,17 +297,22 @@ async def test_live_transcription_over_webrtc(
     assert session["error"] is None, session
     for alternatives in expected_any:
         assert any(word in text for word in alternatives), (alternatives, text)
-    # Live conversation budget for STT: the final transcript must follow the caller's
-    # last word quickly. This includes the VAD's 0.2 s stop delay and network RTT.
-    assert e2e_ms < 2000, f"final transcript took {e2e_ms:.0f} ms after end of speech"
+    # STT budget: once the VAD hears silence, Deepgram's finalized transcript must
+    # follow quickly (measured 110-610 ms on the EU endpoint, Milestone 2).
+    assert all(ms < 1000 for ms in session["stt_latencies_ms"]), session["stt_latencies_ms"]
+    # Turn budget: the caller's turn reaches the LLM as soon as smart-turn judges the
+    # sentence complete (~0.5-1 s after the last word), or after its 3 s silence fallback
+    # when it judges it unfinished. The synthetic voices' flat intonation sometimes
+    # triggers the fallback; tuning this trade-off is Milestone 5 (turn-taking).
+    assert e2e_ms < 3500, f"turn ended {e2e_ms:.0f} ms after end of speech"
 
 
 @pytest.mark.integration
 async def test_rejected_deepgram_key_ends_call_with_error(
-    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, silent_llm: None
 ) -> None:
     """A real Deepgram rejection (invalid key) must end the call and record why."""
-    bad = Settings(_env_file=None, deepgram_api_key="0" * 40)
+    bad = Settings(_env_file=None, deepgram_api_key="0" * 40, groq_api_key="unused")
     monkeypatch.setattr("app.voice.bot.get_settings", lambda: bad)
     client.app.dependency_overrides[get_settings] = lambda: bad  # type: ignore[attr-defined]
 
@@ -308,8 +341,26 @@ async def test_rejected_deepgram_key_ends_call_with_error(
 
 @pytest.mark.integration
 @needs_deepgram
-async def test_silence_produces_no_transcript(client: httpx.AsyncClient) -> None:
+async def test_silence_produces_no_transcript(client: httpx.AsyncClient, silent_llm: None) -> None:
     session = await _call_and_get_transcript(client, WavTrack(None), wait_after_secs=3.0)
     assert session["status"] == "ended", session
     assert session["transcript"] == []
     assert session["startup_ms"] is not None
+
+
+@pytest.mark.integration
+@needs_deepgram
+async def test_rejected_groq_key_ends_call_with_error(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real Groq rejection (invalid key) on the caller's first turn ends the call."""
+    real = get_settings()
+    bad = real.model_copy(update={"groq_api_key": SecretStr("gsk_" + "0" * 52)})
+    monkeypatch.setattr("app.voice.bot.get_settings", lambda: bad)
+
+    session = await _call_and_get_transcript(client, WavTrack(FIXTURES / "booking_normal.wav"))
+    assert session["status"] == "error", session
+    assert "GroqLLMService" in session["error"], session
+    assert "401" in session["error"] or "invalid" in session["error"].lower(), session
+    roles = {t["role"] for t in session["transcript"]}
+    assert roles == {"user"}, session  # the caller was heard, but never answered

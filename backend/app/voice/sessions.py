@@ -33,6 +33,17 @@ class TranscriptEntry:
     at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
+@dataclass
+class ToolCallRecord:
+    """One LLM tool call. Arguments are not stored: they contain caller details."""
+
+    name: str
+    ok: bool
+    error_code: str | None
+    duration_ms: float
+    at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
 class PeerConnection(Protocol):
     """The part of `SmallWebRTCConnection` the session manager relies on."""
 
@@ -56,6 +67,10 @@ class VoiceSession:
     transcript: list[TranscriptEntry] = field(default_factory=list)
     # Time from VAD end-of-speech to the final transcript, per utterance.
     stt_latencies_ms: list[float] = field(default_factory=list)
+    # Time from the end of the caller's turn to the assistant's first word of text,
+    # per reply (includes turn detection hand-off, tool calls and LLM time-to-first-token).
+    response_latencies_ms: list[float] = field(default_factory=list)
+    tool_calls: list[ToolCallRecord] = field(default_factory=list)
 
     def mark_active(self) -> None:
         if self.status == "connecting":
@@ -75,6 +90,16 @@ class VoiceSession:
 
     def add_transcript(self, role: TranscriptRole, text: str) -> None:
         self.transcript.append(TranscriptEntry(role=role, text=text))
+
+    def record_tool_call(self, name: str, result: dict, duration_ms: float) -> None:
+        self.tool_calls.append(
+            ToolCallRecord(
+                name=name,
+                ok=bool(result.get("ok")),
+                error_code=result.get("error_code"),
+                duration_ms=duration_ms,
+            )
+        )
 
     def record_error(self, message: str, *, fatal: bool) -> None:
         if len(message) > MAX_ERROR_CHARS:

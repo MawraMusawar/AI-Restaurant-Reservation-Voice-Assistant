@@ -1,15 +1,14 @@
 from pipecat.frames.frames import (
     InputAudioRawFrame,
     InterimTranscriptionFrame,
+    LLMTextFrame,
     TranscriptionFrame,
-    UserStartedSpeakingFrame,
-    UserStoppedSpeakingFrame,
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.tests.utils import SleepFrame, run_test
 
-from app.voice.processors import LiveEdgeAudioGate, SessionRecorder, VADSpeakingBridge
+from app.voice.processors import LiveEdgeAudioGate, ResponseLatencyRecorder, SessionRecorder
 from app.voice.sessions import VoiceSession
 
 FRAME_SECS = 0.02  # 20 ms frames, as delivered by the WebRTC input transport
@@ -67,19 +66,6 @@ def _interim(text: str) -> InterimTranscriptionFrame:
     return InterimTranscriptionFrame(text=text, user_id="caller", timestamp="2026-11-06T00:00:00Z")
 
 
-async def test_vad_bridge_emits_user_speaking_frames() -> None:
-    await run_test(
-        VADSpeakingBridge(),
-        frames_to_send=[VADUserStartedSpeakingFrame(), VADUserStoppedSpeakingFrame()],
-        expected_down_frames=[
-            VADUserStartedSpeakingFrame,
-            UserStartedSpeakingFrame,
-            VADUserStoppedSpeakingFrame,
-            UserStoppedSpeakingFrame,
-        ],
-    )
-
-
 async def test_session_recorder_marks_session_ready_on_start() -> None:
     session = VoiceSession(session_id="s1")
     await run_test(SessionRecorder(session), frames_to_send=[], expected_down_frames=[])
@@ -87,14 +73,16 @@ async def test_session_recorder_marks_session_ready_on_start() -> None:
     assert session.startup_ms is not None and session.startup_ms >= 0
 
 
-async def test_session_recorder_keeps_only_final_transcripts() -> None:
+async def test_session_recorder_passes_transcripts_through_unchanged() -> None:
+    # The caller's words are recorded per turn by the user aggregator, not here.
     session = VoiceSession(session_id="s1")
     await run_test(
         SessionRecorder(session),
         frames_to_send=[_interim("a table"), _final("A table for four."), _final("   ")],
         expected_down_frames=[InterimTranscriptionFrame, TranscriptionFrame, TranscriptionFrame],
     )
-    assert [(t.role, t.text) for t in session.transcript] == [("user", "A table for four.")]
+    assert session.transcript == []
+    assert session.stt_latencies_ms == []
 
 
 async def test_session_recorder_measures_latency_after_end_of_speech() -> None:
@@ -119,6 +107,29 @@ async def test_session_recorder_measures_latency_after_end_of_speech() -> None:
             TranscriptionFrame,
         ],
     )
-    assert len(session.transcript) == 2
     assert len(session.stt_latencies_ms) == 1
     assert 40 <= session.stt_latencies_ms[0] < 1000  # ~the 50 ms gap we inserted
+
+
+async def test_response_latency_runs_from_turn_end_to_first_non_empty_text() -> None:
+    session = VoiceSession(session_id="s1")
+    times = iter([10.0, 10.75])  # turn end, then the first real token
+    recorder = ResponseLatencyRecorder(session, clock=lambda: next(times))
+    recorder.mark_user_turn_end()
+    await run_test(
+        recorder,
+        frames_to_send=[LLMTextFrame(""), LLMTextFrame("Sure,"), LLMTextFrame(" what time?")],
+        expected_down_frames=[LLMTextFrame, LLMTextFrame, LLMTextFrame],
+    )
+    assert session.response_latencies_ms == [750.0]
+
+
+async def test_response_latency_ignores_text_without_a_caller_turn() -> None:
+    # e.g. a reply triggered by the system, not by the caller finishing a turn.
+    session = VoiceSession(session_id="s1")
+    await run_test(
+        ResponseLatencyRecorder(session),
+        frames_to_send=[LLMTextFrame("Hello")],
+        expected_down_frames=[LLMTextFrame],
+    )
+    assert session.response_latencies_ms == []

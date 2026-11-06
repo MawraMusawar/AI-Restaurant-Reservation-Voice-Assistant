@@ -4,6 +4,8 @@ import { RTVIEvent } from "@pipecat-ai/client-js";
 import { useRTVIClientEvent } from "@pipecat-ai/client-react";
 import { useCallback, useState } from "react";
 
+import { isAssistantMessage } from "@/lib/assistant-messages";
+
 export type TranscriptLine = {
   id: string;
   role: "user" | "assistant";
@@ -13,14 +15,26 @@ export type TranscriptLine = {
 };
 
 /**
- * Live call transcript built from RTVI `user-input` messages.
+ * Live call transcript.
  *
- * Deepgram sends interim results for the current utterance (each one replaces the
- * previous one), then a final result that fixes the line. The next interim
- * result starts a new line. Assistant lines are added in Milestone 3.
+ * Caller lines come from RTVI `user-input` messages: Deepgram sends interim
+ * results for the current utterance (each one replaces the previous one), then a
+ * final result that fixes the line. The next interim result starts a new line.
+ * Assistant lines come from the agent's `assistant-message` server messages.
  */
 export function useCallTranscript() {
   const [lines, setLines] = useState<TranscriptLine[]>([]);
+
+  useRTVIClientEvent(RTVIEvent.ServerMessage, (data: unknown) => {
+    if (!isAssistantMessage(data) || !data.text.trim()) return;
+    const line: TranscriptLine = {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      text: data.text.trim(),
+      final: true,
+    };
+    setLines((prev) => [...prev, line]);
+  });
 
   useRTVIClientEvent(RTVIEvent.UserInput, (data) => {
     if (data.input_type !== "transcription") return;

@@ -15,6 +15,12 @@ import { useCallback, useEffect, useState } from "react";
 
 import { AudioLevelMeter } from "@/components/call/audio-level-meter";
 import { TranscriptPanel } from "@/components/call/transcript-panel";
+import {
+  describeAssistantError,
+  describeToolActivity,
+  isAssistantError,
+  isAssistantMessage,
+} from "@/lib/assistant-messages";
 import { useCallTranscript } from "@/lib/use-call-transcript";
 import { useTrackAudioLevel } from "@/lib/use-track-audio-level";
 import { describeConnectError, describeDeviceError } from "@/lib/voice-errors";
@@ -85,6 +91,10 @@ function CallPanel() {
   const [error, setError] = useState<string | null>(null);
   const [userSpeaking, setUserSpeaking] = useState(false);
   const [botSpeaking, setBotSpeaking] = useState(false);
+  const [thinking, setThinking] = useState(false);
+  const [toolActivity, setToolActivity] = useState<string | null>(null);
+  // Non-fatal problems (e.g. LLM rate limit): the call continues.
+  const [notice, setNotice] = useState<string | null>(null);
   const [localLevel, setLocalLevel] = useState(0);
   // RemoteAudioLevel never fires with SmallWebRTC, so measure the bot's track directly.
   const botAudioTrack = usePipecatClientMediaTrack("audio", "bot");
@@ -106,6 +116,9 @@ function CallPanel() {
     setCallStartedAt(null);
     setUserSpeaking(false);
     setBotSpeaking(false);
+    setThinking(false);
+    setToolActivity(null);
+    setNotice(null);
     setLocalLevel(0);
   });
   useRTVIClientEvent(RTVIEvent.UserStartedSpeaking, () => setUserSpeaking(true));
@@ -116,6 +129,17 @@ function CallPanel() {
   useRTVIClientEvent(RTVIEvent.DeviceError, (deviceError) =>
     setError(describeDeviceError(deviceError)),
   );
+  // What the assistant is doing between the caller's turn and its reply.
+  useRTVIClientEvent(RTVIEvent.BotLlmStarted, () => setThinking(true));
+  useRTVIClientEvent(RTVIEvent.BotLlmStopped, () => setThinking(false));
+  useRTVIClientEvent(RTVIEvent.LLMFunctionCallStarted, (data) =>
+    setToolActivity(describeToolActivity(data.function_name)),
+  );
+  useRTVIClientEvent(RTVIEvent.LLMFunctionCallStopped, () => setToolActivity(null));
+  useRTVIClientEvent(RTVIEvent.ServerMessage, (data: unknown) => {
+    if (isAssistantError(data)) setNotice(describeAssistantError(data));
+    else if (isAssistantMessage(data)) setNotice(null);
+  });
   useRTVIClientEvent(RTVIEvent.Error, (message) => {
     const data = message.data as { message?: string } | undefined;
     console.warn("Voice pipeline error:", data?.message);
@@ -151,6 +175,9 @@ function CallPanel() {
     await client?.disconnect();
   }, [client]);
 
+  const assistantActivity = botSpeaking
+    ? "Speaking"
+    : (toolActivity ?? (thinking ? "Thinking…" : "Listening"));
   const elapsed = callStartedAt === null ? 0 : Math.max(0, Math.floor((now - callStartedAt) / 1000));
 
   return (
@@ -177,7 +204,12 @@ function CallPanel() {
 
       <div className="mt-8 grid grid-cols-2 gap-3">
         <Indicator label="You" detail={userSpeaking ? "Speaking" : "Listening"} active={inCall && userSpeaking} tone="caller" />
-        <Indicator label="Assistant" detail={botSpeaking ? "Speaking" : "Quiet"} active={inCall && botSpeaking} tone="agent" />
+        <Indicator
+          label="Assistant"
+          detail={assistantActivity}
+          active={inCall && (botSpeaking || thinking || toolActivity !== null)}
+          tone="agent"
+        />
       </div>
 
       <div className="mt-6 flex justify-between gap-6 rounded-2xl bg-zinc-50 px-5 py-4 dark:bg-zinc-950">
@@ -191,6 +223,12 @@ function CallPanel() {
         <StatusItem label="Connection" value={transportState} />
         <StatusItem label="Microphone" value={isMicEnabled ? "On" : "Muted"} />
       </dl>
+
+      {notice && (
+        <p role="status" className="mt-6 rounded-xl bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:bg-amber-950 dark:text-amber-200">
+          {notice}
+        </p>
+      )}
 
       {error && (
         <p role="alert" className="mt-6 rounded-xl bg-red-50 px-4 py-3 text-sm text-red-700 dark:bg-red-950 dark:text-red-300">

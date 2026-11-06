@@ -46,6 +46,12 @@ class Settings(BaseSettings):
     # --- LLM (Milestone 3) ---
     groq_api_key: SecretStr | None = None
     groq_model: str = "openai/gpt-oss-120b"
+    # Comma-separated models tried, in order, when the main model is rate-limited.
+    # Each Groq model has its own free-tier budget (~8K tokens/min, 200K tokens/day).
+    # Not gpt-oss-20b: in testing it invented caller details and answered for the caller.
+    groq_fallback_models: str = "qwen/qwen3.8-27b"
+    # "low" keeps time-to-first-token around 0.5-0.8 s on gpt-oss.
+    groq_reasoning_effort: Literal["low", "medium", "high"] = "low"
 
     # --- Text-to-Speech (Milestone 4) ---
     elevenlabs_api_key: SecretStr | None = None
@@ -55,6 +61,10 @@ class Settings(BaseSettings):
     supabase_url: str | None = None
     supabase_service_role_key: SecretStr | None = None
     database_url: SecretStr | None = None
+
+    @property
+    def groq_fallback_model_list(self) -> list[str]:
+        return [m.strip() for m in self.groq_fallback_models.split(",") if m.strip()]
 
     @property
     def cors_origin_list(self) -> list[str]:

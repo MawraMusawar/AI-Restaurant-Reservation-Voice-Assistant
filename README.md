@@ -13,7 +13,7 @@ A real-time, browser-based AI voice receptionist for restaurants. Callers speak 
 | 0. Project planning and foundation | ✅ Done |
 | 1. Real-time voice infrastructure (Pipecat + SmallWebRTC) | ✅ Done (verified in Chrome with a simulated microphone) |
 | 2. Deepgram STT | ✅ Done (real Deepgram tests + Chrome E2E) |
-| 3. Groq LLM + tool calling | ⬜ Not started |
+| 3. Groq LLM + tool calling | ✅ Done (real Groq conversation tests + Chrome E2E) |
 | 4. ElevenLabs TTS | ⬜ Not started |
 | 5. Complete conversation engine | ⬜ Not started |
 | 6. Supabase database + reservation engine | ⬜ Not started |
@@ -53,7 +53,10 @@ API accounts (all on free tiers; needed in later milestones):
 │   │   ├── main.py        # FastAPI app factory and lifespan
 │   │   ├── config.py      # Settings from environment variables (secrets as SecretStr)
 │   │   ├── logging_setup.py  # Structured logging (loguru, optional JSON)
-│   │   └── api/           # HTTP routes
+│   │   ├── api/           # HTTP routes (health)
+│   │   ├── voice/         # Signaling, session lifecycle, the Pipecat pipeline, processors
+│   │   ├── services/      # One module per provider: stt.py (Deepgram), llm.py (Groq)
+│   │   └── agent/         # Conversation logic: restaurant profile, booking rules, prompt, tools
 │   ├── tests/
 │   ├── pyproject.toml
 │   └── .env.example
@@ -92,8 +95,9 @@ The health endpoint reports which integrations have credentials configured. It s
 
 ```bash
 cd backend
-uv run pytest                        # all tests (integration tests use a few seconds of Deepgram quota)
+uv run pytest                        # all tests (integration tests use Deepgram and Groq quota)
 uv run pytest -m "not integration"   # fast unit/API tests only, no external APIs
+uv run pytest tests/test_agent_llm.py   # real Groq conversations (~30K of the 200K daily tokens)
 uv run ruff check .      # lint
 uv run ruff format .     # format
 ```
@@ -117,22 +121,73 @@ npx tsc --noEmit    # type-check
 npm run build       # production build
 ```
 
-## Live Call (Milestone 2: live transcription)
+## Live Call (Milestone 3: the assistant understands and replies)
 
-1. Set `DEEPGRAM_API_KEY` in `backend/.env`. From South Asia, also set `DEEPGRAM_BASE_URL=api.eu.deepgram.com` (see the measurements below).
+1. Set `DEEPGRAM_API_KEY` and `GROQ_API_KEY` in `backend/.env`. From South Asia, also set `DEEPGRAM_BASE_URL=api.eu.deepgram.com` (see the measurements below).
 2. Start the backend and frontend (see below).
-3. Open http://localhost:3000/call, wait for **On call**, and speak. Interim words appear in italics and are replaced by final sentences when you pause.
+3. Open http://localhost:3000/call and wait for **On call**. The assistant greets you. Ask for a table or about the restaurant. Your words appear live; the assistant's replies appear as text (it speaks them from Milestone 4). While it works, the status shows *Thinking…* or *Checking availability…*.
 
-Pipeline: `mic → SmallWebRTC → live-edge gate → Silero VAD → Deepgram (nova-3, streaming) → session recorder`. On end of speech, the VAD triggers a Deepgram *finalize*, so the final transcript doesn't wait for Deepgram's own endpointing.
+Pipeline: `mic → SmallWebRTC → live-edge gate → Deepgram (nova-3, streaming) → user aggregator (Silero VAD + smart-turn end-of-turn model) → Groq LLM (tool calling) → assistant aggregator`. The VAD runs in the user aggregator and sends its events upstream too, so Deepgram is still asked to *finalize* the moment you stop speaking.
+
+> **Bookings are not live yet.** Until the database exists (Milestone 6), the reservation tools validate everything (dates, opening hours, party size) but then report that the booking system is offline. The assistant says it can't check or book right now. It never pretends a table is free or booked.
 
 | Endpoint | Purpose |
 |---|---|
 | `POST /api/offer` | WebRTC offer → SDP answer (starts a voice session) |
 | `PATCH /api/offer` | Trickle ICE candidates |
 | `GET /api/voice/status` | Can a call start now? (credentials configured, free line) |
-| `GET /api/voice/sessions` | Active and recent sessions with transcript, startup time, STT latency and errors (in memory until Milestone 6) |
+| `GET /api/voice/sessions` | Active and recent sessions: transcript (both sides), startup time, STT and response latency, tool calls (name, result, duration; never arguments), errors. In memory until Milestone 6 |
 
-Limits: at most `VOICE_MAX_CONCURRENT_SESSIONS` calls at once (default 2). A browser that never completes the connection is dropped after 30 s, and an idle call ends after 5 minutes. If Deepgram rejects the key or quota, the call ends and the error is recorded on the session.
+Limits: at most `VOICE_MAX_CONCURRENT_SESSIONS` calls at once (default 2). A browser that never completes the connection is dropped after 30 s, and an idle call ends after 5 minutes. If Deepgram or Groq rejects the key, the call ends and the error is recorded on the session.
+
+## Conversation Agent (Milestone 3)
+
+Code: `backend/app/agent/` (conversation logic, testable with text alone) and `backend/app/services/llm.py`.
+
+- **Restaurant profile** (`restaurant.py`): the fictional demo restaurant *Olive & Ember* (Lahore, `Asia/Karachi`, closed Mondays). It moves to the database in Milestone 6.
+- **System prompt** (`prompt.py`): goals and rules, not a script. It's built per call with the restaurant's local date and the next 7 days, so "tomorrow" or "Friday" resolve correctly. The greeting is fixed, so the call opens instantly without an LLM request.
+- **Booking rules** (`booking_rules.py`): parse and validate date, time and party size against opening hours, last seating (60 min before close), minimum notice (30 min), booking window (30 days) and max party size (10). Each failure returns a code and a message the assistant explains.
+- **Tools** (`tools.py`), called through structured function calling:
+
+| Tool | Behaviour |
+|---|---|
+| `get_restaurant_info` | Address, hours, contact, services, policies |
+| `check_availability` / `get_available_tables` | Validates the request, then asks the reservation backend |
+| `create_reservation` | **Two-step, enforced in code:** the first call only returns the details to read back. The backend is called only by a later call with the *same* details, after the caller has spoken again, with `caller_confirmed: true` |
+| `get_reservation` | By booking reference, or by name and phone |
+| `cancel_reservation` | Two-step like booking: reads the booking back first |
+
+The two-step rule exists because testing showed the model booking straight after hearing the name, with no read-back, despite the prompt. Every tool returns `{ok, ...}`; on failure it adds `error_code` and `message`. Exceptions become `internal_error` results, so the caller hears an apology instead of silence.
+
+### Groq free tier
+
+Measured on this account (response headers) and documented by Groq: **every model has its own budget of ~8K tokens/minute, 200K tokens/day, 30 requests/minute and 1,000 requests/day.** One request (prompt, tools and history) is about 2–2.5K tokens, so one model serves only 3–4 requests a minute.
+
+- **Failover:** when the main model (`openai/gpt-oss-120b`) is rate-limited, the same request is retried immediately on `qwen/qwen3.8-27b`, which has its own budget. It is free, never a paid tier, and every failover is logged and recorded on the session. `openai/gpt-oss-20b` was rejected as a fallback: in testing it invented caller details and answered for the caller.
+- If every model is rate-limited, the call stays up, the turn goes unanswered, and the page shows *"The assistant reached the Groq free-tier rate limit… say that again."*
+- **Daily budget:** a full booking call is roughly 15–20 requests (~40K tokens), so expect about 5 full calls per model per day, about 10 with failover. Keep this in mind when rehearsing the demo.
+
+### Measured (2026-11-06, real Groq)
+
+| What | Result |
+|---|---|
+| Groq time to first token (`gpt-oss-120b`, reasoning low) | 0.5–0.8 s per request |
+| Caller's turn end → assistant's first word, no tool | 0.4–1.0 s |
+| Caller's turn end → first word, with one tool call (two requests) | 1.0–1.9 s (browser E2E: 1.94 s) |
+| Caller's last word → turn end (smart-turn) | 0.3–1.0 s when judged complete; 3 s fallback when judged unfinished |
+
+Conversation tests (`tests/test_agent_llm.py`, real Groq, run with the scripted backend that stands in for the Milestone 6 database):
+- **Missing information:** "I'd like to book a table" → asks for party size, with no tool call.
+- **Relative dates:** "tomorrow at 7" → `check_availability(2026-11-07, 19:00, 4)`; 7 PM was taken, so it offered 6:30 and 8:15.
+- **Confirmation:** booking only after the read-back and "Yes": `Ali Raza, 4, 2026-11-07 20:15`, reference given.
+- **Corrections:** "actually make that six" → availability re-checked with 6 guests.
+- **Restaurant info:** Sunday closing time correct, Monday reported closed.
+- **Honesty:** with the offline backend, never claims a table is available or booked.
+
+### Known limitations (LLM)
+- **Turn splitting:** the caller's turn can split at short pauses ("Actually," / "can we change that to 6:30?"), and smart-turn sometimes waits its 3 s fallback when a sentence sounds unfinished. Pipecat cancels a reply in progress when the caller continues. Tuning is Milestone 5.
+- **Free-tier throughput** limits how fast and how many calls can run (see above).
+- **No spoken replies yet** (Milestone 4) and **no real bookings yet** (Milestone 6).
 
 ### Measured STT performance (2026-11-06, from Pakistan, real Deepgram)
 
@@ -177,4 +232,5 @@ Use two terminals:
 | Home page says "Backend offline" | Start the backend (terminal 1), then refresh the page. |
 | `node` not found after installing Node.js | Restart VS Code or the terminal so the new PATH is loaded. |
 | `EPERM: operation not permitted, rename ...` (Next.js), ruff/uv "Access is denied" | The drive's permissions let normal users create files but not rename or delete them. Grant yourself Modify on the project folder (no admin needed, since you own it): `icacls "D:\Agentic Voice-AI" /grant "${env:USERNAME}:(OI)(CI)M"`, then restart `npm run dev`. |
+| "The assistant reached the Groq free-tier rate limit" | Every free model's per-minute budget is used up. Wait ~30 s. If it keeps happening, the daily budget (200K tokens per model) is spent; it resets within 24 h. Usage: https://console.groq.com/settings/limits |
 | `WinError 10013` or wrong/old API responses on port 8000 | Another process holds port 8000. Find it with `Get-NetTCPConnection -LocalPort 8000` and stop it with `taskkill /PID <pid> /T /F`. |

@@ -98,6 +98,14 @@ class TranscriptEntryOut(BaseModel):
     at: datetime
 
 
+class ToolCallOut(BaseModel):
+    name: str
+    ok: bool
+    error_code: str | None
+    duration_ms: float
+    at: datetime
+
+
 class VoiceSessionOut(BaseModel):
     session_id: str
     status: SessionStatus
@@ -111,6 +119,8 @@ class VoiceSessionOut(BaseModel):
     errors: list[str]
     transcript: list[TranscriptEntryOut]
     stt_latencies_ms: list[float]
+    response_latencies_ms: list[float]
+    tool_calls: list[ToolCallOut]
 
     @classmethod
     def from_session(cls, s: VoiceSession) -> "VoiceSessionOut":
@@ -129,6 +139,17 @@ class VoiceSessionOut(BaseModel):
                 TranscriptEntryOut(role=t.role, text=t.text, at=t.at) for t in s.transcript
             ],
             stt_latencies_ms=list(s.stt_latencies_ms),
+            response_latencies_ms=list(s.response_latencies_ms),
+            tool_calls=[
+                ToolCallOut(
+                    name=c.name,
+                    ok=c.ok,
+                    error_code=c.error_code,
+                    duration_ms=c.duration_ms,
+                    at=c.at,
+                )
+                for c in s.tool_calls
+            ],
         )
 
 

@@ -8,6 +8,7 @@ dependencies = [
     "pipecat-ai[deepgram,elevenlabs,groq,silero,webrtc]==1.15.0",
     "pydantic-settings>=2.16.2",
     "python-dotenv>=1.2.4",
+    "tzdata>=2026.6",
     "uvicorn[standard]>=0.54.0",
 ]
 
