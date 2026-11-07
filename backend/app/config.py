@@ -85,6 +85,11 @@ class Settings(BaseSettings):
     database_url: SecretStr | None = None
     db_pool_max_size: int = Field(default=5, ge=1, le=20)
     db_command_timeout_secs: float = Field(default=10.0, gt=0)
+    # --- Admin screens (Milestone 7) ---
+    # Password for the dashboard, reservations, settings and call logs. Unset = locked.
+    admin_password: SecretStr | None = None
+    # Signs the admin session cookie. Unset = derived from admin_password.
+    admin_session_secret: SecretStr | None = None
     # The restaurant this deployment answers for (restaurants.slug).
     restaurant_slug: str = "olive-and-ember"
 

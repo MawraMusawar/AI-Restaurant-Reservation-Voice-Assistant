@@ -8,13 +8,20 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from functools import partial
 
-from fastapi import FastAPI
+import asyncpg
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from loguru import logger
 from pipecat.transports.smallwebrtc.request_handler import SmallWebRTCRequestHandler
 
 from app import __version__
+from app.api.auth import router as auth_router
+from app.api.calls import router as calls_router
+from app.api.dashboard import router as dashboard_router
 from app.api.health import router as health_router
+from app.api.reservations import router as reservations_router
+from app.api.restaurant_settings import router as settings_router
 from app.config import Settings, get_settings
 from app.db import Database, create_database
 from app.db.sessions import save_session
@@ -82,6 +89,20 @@ async def _warm_up(settings: Settings) -> None:
         logger.opt(exception=True).warning("Voice stack warm-up failed")
 
 
+async def _database_error(_request: Request, exc: Exception) -> JSONResponse:
+    """Database errors in management requests: constraint violations are the client's
+    fault (409/422); anything else means the database is unavailable (503)."""
+    if isinstance(exc, asyncpg.exceptions.UniqueViolationError):
+        return JSONResponse({"detail": "That already exists."}, status_code=409)
+    if isinstance(exc, asyncpg.exceptions.IntegrityConstraintViolationError):
+        return JSONResponse({"detail": "That change violates a data rule."}, status_code=422)
+    logger.opt(exception=exc).error("Database error in request")
+    return JSONResponse(
+        {"detail": "The reservation database is unavailable. Try again shortly."},
+        status_code=503,
+    )
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
     configure_logging(settings.log_level, settings.log_json)
@@ -98,8 +119,19 @@ def create_app() -> FastAPI:
         allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["*"],
     )
-    app.include_router(health_router, prefix="/api")
-    app.include_router(voice_router, prefix="/api")
+    for router in (
+        health_router,
+        voice_router,
+        auth_router,
+        dashboard_router,
+        reservations_router,
+        settings_router,
+        calls_router,
+    ):
+        app.include_router(router, prefix="/api")
+    app.add_exception_handler(asyncpg.PostgresError, _database_error)
+    app.add_exception_handler(asyncpg.InterfaceError, _database_error)
+    app.add_exception_handler(OSError, _database_error)
     return app
 
 

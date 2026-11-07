@@ -18,7 +18,7 @@ import secrets
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from functools import wraps
-from typing import Any
+from typing import Any, Literal
 
 import asyncpg
 from loguru import logger
@@ -87,6 +87,7 @@ class PostgresReservationBackend:
         profile: RestaurantProfile,
         session_id: str | None = None,
         clock: Callable[[], datetime] | None = None,
+        source: Literal["voice", "web", "admin"] = "voice",
     ) -> None:
         assert profile.id is not None, "the profile must come from the database"
         self._pool = pool
@@ -94,6 +95,7 @@ class PostgresReservationBackend:
         self._restaurant_id = profile.id
         self._session_id = session_id
         self._clock = clock or profile.now
+        self._source = source
 
     # --- helpers -------------------------------------------------------------------
 
@@ -247,7 +249,7 @@ class PostgresReservationBackend:
                                 restaurant_id, table_id, customer_id, booking_reference,
                                 party_size, starts_at, ends_at, special_requests, source,
                                 voice_session_id
-                            ) values ($1, $2, $3, $4, $5, $6, $7, $8, 'voice', $9)
+                            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $10, $9)
                             returning *
                         )
                         select r.*, c.name as customer_name, t.area
@@ -263,6 +265,7 @@ class PostgresReservationBackend:
                         end,
                         r.special_requests,
                         self._session_id,
+                        self._source,
                     )
             except asyncpg.exceptions.ExclusionViolationError:
                 logger.info("Table {} was taken concurrently; trying the next one", table.label)

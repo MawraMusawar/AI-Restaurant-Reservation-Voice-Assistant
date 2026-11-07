@@ -24,3 +24,22 @@ body {
   color: var(--foreground);
   font-family: var(--font-geist-sans), Arial, Helvetica, sans-serif;
 }
+
+/* Chart series color (dataviz reference palette, slot 1). Validated against this app's
+   card surfaces: #2a78d6 on white, #3987e5 on zinc-900 - all checks pass. */
+.viz-root {
+  --series-1: #2a78d6;
+}
+@media (prefers-color-scheme: dark) {
+  .viz-root {
+    --series-1: #3987e5;
+  }
+}
+.viz-bar {
+  background: var(--series-1);
+}
+@media (forced-colors: active) {
+  .viz-bar {
+    background: CanvasText;
+  }
+}

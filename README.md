@@ -17,7 +17,7 @@ A real-time, browser-based AI voice receptionist for restaurants. Callers speak 
 | 4. ElevenLabs TTS | ✅ Done (spoken replies, barge-in) |
 | 5. Complete conversation engine | ✅ Done (turn-taking, silence, goodbye, error recovery; Chrome E2E) |
 | 6. Supabase database + reservation engine | ✅ Done (database tests + real-Groq booking against Supabase; spoken Chrome booking pending a quiet CPU) |
-| 7. Frontend dashboard | ⬜ Not started |
+| 7. Frontend dashboard | ✅ Done (all screens; API tests + 19-check Chrome E2E) |
 | 8. Testing and debugging | ⬜ Not started |
 | 9. Demo preparation | ⬜ Not started |
 
@@ -65,7 +65,8 @@ API accounts (all on free tiers; needed in later milestones):
 │   ├── migrations/        # SQL schema (0001_init.sql)
 │   └── seed.sql           # demo restaurant Olive & Ember
 └── frontend/              # Next.js 16 + React 19 + TypeScript + Tailwind
-    ├── src/app/           # App Router pages
+    ├── src/app/           # App Router: (app)/ = sidebar screens, login/
+    ├── src/lib/           # API client, data hook, formatting, types
     ├── src/components/
     ├── next.config.ts     # proxies /api/* to the FastAPI backend
     └── .env.example
@@ -297,6 +298,34 @@ The backend talks to PostgreSQL directly with `asyncpg`. No Supabase REST keys a
 - `tests/test_db_reservations.py`: 9 tests, each in a throwaway restaurant, so your demo data isn't touched.
 - `tests/test_agent_llm_db.py`: real Groq books a table, reads back the reference, then cancels with confirmation. The database is checked at each step.
 
+## Web App (Milestone 7)
+
+Open http://localhost:3000. The **Live call** screen is public (it's the caller's side). Everything else needs the staff login: set `ADMIN_PASSWORD` in `backend/.env`, restart the backend, and sign in at `/login`.
+
+| Screen | What it does |
+|---|---|
+| **Dashboard** (`/`) | Today's bookings and guests, total and upcoming reservations, voice calls, bookings made by voice and the booking rate; charts of bookings for the next 7 days and calls for the last 7 days (hover for values, "Show as table" for exact numbers); recent conversations and reservation activity. Refreshes every 15 s. |
+| **Live call** (`/call`) | The phone-call screen (Milestones 1-6) |
+| **Reservations** (`/reservations`) | Filter by day range, status, or name/phone/reference; **create** bookings (same rules and double-booking guards as the voice agent; a full slot offers nearby free times as one-click buttons); **cancel** with confirmation |
+| **Call logs** (`/calls`) | Every call with its first request, duration, outcome and booking; click one for the transcript (interruptions marked), latency, errors and the booking it made. Calls in progress show as *Live*. |
+| **Settings** (`/settings`) | Restaurant details and booking rules; opening hours per weekday; tables (add, take out of use); AI personality (assistant name, personality, greeting, voice); system status. Changes apply from the next call. |
+
+**API** (all under `/api`, staff login required except `auth`):
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /auth/login`, `POST /auth/logout`, `GET /auth/me` | Staff session: an HttpOnly, SameSite=Lax cookie with an HMAC-signed token, valid 12 h. Changing `ADMIN_PASSWORD` signs everyone out. |
+| `GET /dashboard` | Stats, charts, recent calls and activity |
+| `GET /reservations?from=&to=&status=&q=`, `POST /reservations`, `POST /reservations/{ref}/cancel` | List / create (201; 409 with `alternatives` when full; 422 with a rule `code`) / cancel (404, or 409 if already cancelled or in the past) |
+| `GET /settings`, `PUT /settings/restaurant`, `PUT /settings/hours`, `PUT /settings/assistant`, `POST /settings/tables`, `PATCH /settings/tables/{id}` | Settings (validated: IANA time zone, closing after opening, party-size limits, unique table labels) |
+| `GET /calls`, `GET /calls/{id}` | Call logs (stored + live) |
+
+Database errors in these requests become **503** (unavailable), **409** (duplicate) or **422** (rule violated), never a crash. `GET /api/voice/sessions` (live debug data, including transcripts) requires the staff login when `APP_ENV=production`.
+
+**Tests:**
+- `tests/test_management_api.py`: auth (expiry, forgery, logout, locked without a password) and every endpoint, against the real database in a throwaway restaurant.
+- Browser E2E (Chrome, test servers on 8010/3010, throwaway restaurant, 19 checks): the login redirect and wrong password; the dashboard; a staff booking, a full slot with a one-click alternative, and a cancellation; a call transcript; hours, tables (including duplicate rejection) and assistant settings; the dashboard counts; sign-out; no horizontal scroll at phone width; no console errors.
+
 ## Running Everything Locally
 
 Use two terminals:
@@ -313,6 +342,8 @@ Use two terminals:
 - API keys live only in `backend/.env`, which is git-ignored. They are never sent to the browser.
 - `.env.example` documents every variable without real values.
 - Secrets are typed as `SecretStr`, so they don't appear in logs or reprs.
+- Staff screens need `ADMIN_PASSWORD`. The session cookie is HttpOnly (JavaScript can't read it) and HMAC-signed with an expiry; the password is compared in constant time.
+- Supabase tables have row-level security on with no policies, so the public REST API can't read them; only the backend (as table owner) can.
 
 ---
 

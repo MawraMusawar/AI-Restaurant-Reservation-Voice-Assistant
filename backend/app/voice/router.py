@@ -19,6 +19,7 @@ from pipecat.transports.smallwebrtc.request_handler import (
 )
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.api.auth import require_admin
 from app.config import Settings, get_settings
 from app.services import missing_voice_credentials
 from app.voice.sessions import (
@@ -273,6 +274,18 @@ async def ice_candidates(body: IcePatchRequest, voice: VoiceDep) -> dict[str, st
     return {"status": "success"}
 
 
-@router.get("/voice/sessions", response_model=list[VoiceSessionOut])
+def require_admin_in_production(request: Request, settings: SettingsDep) -> None:
+    """Live session details include transcripts: admin-only in production. In development
+    they stay open for debugging and the integration tests."""
+    if settings.app_env == "production":
+        require_admin(request, settings)
+
+
+@router.get(
+    "/voice/sessions",
+    response_model=list[VoiceSessionOut],
+    dependencies=[Depends(require_admin_in_production)],
+)
 async def list_voice_sessions(voice: VoiceDep) -> list[VoiceSessionOut]:
+    """In-memory sessions with live metrics (debugging). Call logs: GET /api/calls."""
     return [VoiceSessionOut.from_session(s) for s in voice.sessions.list_sessions()]
