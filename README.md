@@ -16,7 +16,7 @@ A real-time, browser-based AI voice receptionist for restaurants. Callers speak 
 | 3. Groq LLM + tool calling | ✅ Done (real Groq conversation tests + Chrome E2E) |
 | 4. ElevenLabs TTS | ✅ Done (spoken replies, barge-in) |
 | 5. Complete conversation engine | ✅ Done (turn-taking, silence, goodbye, error recovery; Chrome E2E) |
-| 6. Supabase database + reservation engine | ⬜ Not started |
+| 6. Supabase database + reservation engine | ✅ Done (database tests + real-Groq booking against Supabase; spoken Chrome booking pending a quiet CPU) |
 | 7. Frontend dashboard | ⬜ Not started |
 | 8. Testing and debugging | ⬜ Not started |
 | 9. Demo preparation | ⬜ Not started |
@@ -56,10 +56,14 @@ API accounts (all on free tiers; needed in later milestones):
 │   │   ├── api/           # HTTP routes (health)
 │   │   ├── voice/         # Signaling, session lifecycle, the Pipecat pipeline, processors
 │   │   ├── services/      # One module per provider: stt.py (Deepgram), llm.py (Groq), tts.py (ElevenLabs)
-│   │   └── agent/         # Conversation logic: restaurant profile, booking rules, prompt, tools
+│   │   ├── agent/         # Conversation logic: restaurant profile, booking rules, availability, prompt, tools
+│   │   └── db/            # PostgreSQL: pool, migration runner, restaurant/reservation/call-log repositories
 │   ├── tests/
 │   ├── pyproject.toml
 │   └── .env.example
+├── supabase/
+│   ├── migrations/        # SQL schema (0001_init.sql)
+│   └── seed.sql           # demo restaurant Olive & Ember
 └── frontend/              # Next.js 16 + React 19 + TypeScript + Tailwind
     ├── src/app/           # App Router pages
     ├── src/components/
@@ -76,7 +80,8 @@ The browser only talks to the Next.js origin (`localhost:3000`). Requests to `/a
 ```bash
 cd backend
 uv sync                       # creates .venv with Python 3.12 and installs dependencies
-cp .env.example .env          # then fill in API keys as milestones require them
+cp .env.example .env          # then fill in API keys and DATABASE_URL
+uv run python -m app.db.migrate --seed   # create the tables + demo restaurant (safe to re-run)
 ```
 
 Run the API server:
@@ -98,6 +103,7 @@ cd backend
 uv run pytest                        # all tests (integration tests use Deepgram and Groq quota)
 uv run pytest -m "not integration"   # fast unit/API tests only, no external APIs
 uv run pytest tests/test_agent_llm.py   # real Groq conversations (~30K of the 200K daily tokens)
+uv run pytest tests/test_db_reservations.py   # reservation engine against the real database
 uv run ruff check .      # lint
 uv run ruff format .     # format
 ```
@@ -176,7 +182,7 @@ On a quiet CPU, mid-call dropped audio is 0–0.1 s. Under 100% CPU load (anothe
 - **Call logs:** every session records `end_reason` (`caller_hung_up`, `assistant_ended`, `caller_silent`, `connect_timeout`, `error`, `server_shutdown`). The page tells the caller when the assistant ended the call.
 - **Startup:** the first call after a server (re)start used to block 6–9 s while it built models, schemas and TLS clients. The voice stack now warms up in a worker thread at server start (0.8 s), and the VAD and smart-turn models load off the event loop. Each call still has one ~0.3–0.5 s stall during its TLS handshakes (Python's SSL context creation on Windows, ~0.2 s each), before the greeting.
 
-> **Bookings are not live yet.** Until the database exists (Milestone 6), the reservation tools validate everything (dates, opening hours, party size) but then report that the booking system is offline. The assistant says it can't check or book right now. It never pretends a table is free or booked.
+> **Without a database** (no `DATABASE_URL`, or it's unreachable), calls still work, but the reservation tools report that the booking system is offline and the call page shows *"Bookings are offline"*. The assistant never pretends a table is free or booked.
 
 | Endpoint | Purpose |
 |---|---|
@@ -234,7 +240,6 @@ Conversation tests (`tests/test_agent_llm.py`, real Groq, run with the scripted 
 ### Known limitations (LLM)
 - **Turn splitting:** much reduced (see `VOICE_TURN_END_SILENCE_SECS`), but pauses longer than 0.4 s between sentences still start a new turn, and smart-turn waits its 3 s fallback when a sentence sounds unfinished.
 - **Free-tier throughput** limits how fast and how many calls can run (see above).
-- **No real bookings yet** (Milestone 6).
 - **Fallback model quality:** `qwen3.8-27b` (used when `gpt-oss-120b` is rate-limited) sometimes hangs up without words or announces a check without doing it. The prompt and code guards cover the cases seen so far.
 - **Barge-in flag:** in about 1 of 8 measured barge-ins the audio stopped but the transcript didn't mark the greeting as interrupted.
 
@@ -251,6 +256,46 @@ Accuracy, test fixtures generated with Windows TTS: normal, fast and slow speech
 - **Accents:** only the US-English Windows voices (David, Zira) are available for automated tests. Other accents still need live testing. `DEEPGRAM_LANGUAGE` accepts `en-IN`, `en-GB`, or `multi`.
 - **Speech before "On call" is dropped.** Audio that arrives while Deepgram is still connecting is discarded as stale, so it can't become a lasting delay. Milestone 5's greeting makes the caller wait naturally.
 - **Utterances split at short pauses** (e.g. "...tomorrow evening at" / "seven."). That's fine for display. Milestone 5 adds proper turn detection so the LLM receives whole turns.
+
+## Database and Reservations (Milestone 6)
+
+**Setup:** create a free Supabase project, then **Connect → Direct → Method: Session pooler**, and copy the URI into `backend/.env` as `DATABASE_URL` with your database password filled in. Passwords with `@ # / :` work as typed; the backend encodes them. Then run:
+
+```bash
+cd backend
+uv run python -m app.db.migrate --seed     # tables + demo restaurant; --status lists migrations
+```
+
+The backend talks to PostgreSQL directly with `asyncpg`. No Supabase REST keys are needed, and row-level security keeps the tables closed to Supabase's public REST API.
+
+**Schema** (`supabase/migrations/0001_init.sql`):
+
+| Table | Holds |
+|---|---|
+| `restaurants` | Details, IANA time zone, booking rules (party size, window, notice, last seating, dining duration 90 min, slot step 15 min, phone required?) |
+| `restaurant_hours` | Local opening hours per weekday (no row = closed) |
+| `restaurant_tables` | Label, seats, minimum party, area, active |
+| `customers` | Name, phone (unique per restaurant when given) |
+| `reservations` | Table, customer, unique booking reference (`OE-7K3P9Q`), party size, `starts_at`/`ends_at` (timestamptz), status (`confirmed`/`cancelled`/`completed`/`no_show`), voice session |
+| `voice_sessions`, `conversation_messages` | Call logs: status, end reason, latency and audio-health metrics, the transcript |
+| `assistant_settings` | Assistant name, greeting, personality, voice |
+
+**No double-booking, guaranteed twice:**
+1. **In code** (`app/agent/availability.py`, `app/db/reservations.py`): availability is computed from the tables and the day's confirmed bookings inside the booking transaction. The best-fitting free table (fewest seats) is chosen.
+2. **In the database:** the exclusion constraint `reservations_no_overlap` (`table_id =`, `tstzrange(starts_at, ends_at) &&`, only for `confirmed`) makes overlapping bookings impossible. If two callers race for one table, the loser's insert fails and the next free table is tried. Tested: 5 simultaneous bookings for the last table, exactly 1 succeeds.
+
+**Behaviour:**
+- **Full slot:** the 3 nearest bookable times that day are offered (same rules: hours, last seating, notice).
+- **Time zones:** "Saturday 19:00" is converted with the restaurant's zone (`Asia/Karachi`) and stored as an instant (14:00 UTC).
+- **Booking references:** no 0/O or 1/I, so they're easy to read aloud. The assistant reads them character by character.
+- **Lookup:** by reference, or by the phone number given at booking. **Cancel** is two-step (read back, then confirm). Already-cancelled or past bookings are refused with an explanation.
+- **Hard rule:** `create_reservation` returns `ok: true` with a reference only after the transaction commits. Any database error becomes `database_error` ("nothing was booked"), which the assistant explains. Tested with a dead connection pool.
+- **Call logs:** every finished call is saved (`voice_sessions` + `conversation_messages`). A failed save never affects calls.
+- **Per call:** the restaurant profile (hours, rules, assistant settings) is loaded from the database. If that fails, the call continues with bookings offline.
+
+**Tests against the real database:**
+- `tests/test_db_reservations.py`: 9 tests, each in a throwaway restaurant, so your demo data isn't touched.
+- `tests/test_agent_llm_db.py`: real Groq books a table, reads back the reference, then cancels with confirmation. The database is checked at each step.
 
 ## Running Everything Locally
 
@@ -283,5 +328,8 @@ Use two terminals:
 | `EPERM: operation not permitted, rename ...` (Next.js), ruff/uv "Access is denied" | The drive's permissions let normal users create files but not rename or delete them. Grant yourself Modify on the project folder (no admin needed, since you own it): `icacls "D:\Agentic Voice-AI" /grant "${env:USERNAME}:(OI)(CI)M"`, then restart `npm run dev`. |
 | Transcripts garbled, slow replies, `dropped_audio_secs` > 0 or `loop_stalls` > 0 in `/api/voice/sessions` | The computer's CPU is overloaded (another heavy program), so the real-time audio loop falls behind. Close heavy programs (check Task Manager) and retry. |
 | "The ElevenLabs free voice credits are used up" | The monthly 10,000 credits are spent; they reset monthly. Check https://elevenlabs.io/app/usage |
+| `uv run ...`: "Failed to spawn: uvicorn" | Run it from the `backend` folder; the environment lives there. |
+| "Bookings are offline" on the call page | `DATABASE_URL` is missing or the database is unreachable (see the backend log). Use the **Session pooler** URI (the direct host is IPv6-only), then run `uv run python -m app.db.migrate --seed` and restart the backend. |
+| `getaddrinfo failed` connecting to the database | Usually a password with `@` read as part of the host; the backend now encodes it. Otherwise check the host in `DATABASE_URL`. |
 | "The assistant reached the Groq free-tier rate limit" | Every free model's per-minute budget is used up. Wait ~30 s. If it keeps happening, the daily budget (200K tokens per model) is spent; it resets within 24 h. Usage: https://console.groq.com/settings/limits |
 | `WinError 10013` or wrong/old API responses on port 8000 | Another process holds port 8000. Find it with `Get-NetTCPConnection -LocalPort 8000` and stop it with `taskkill /PID <pid> /T /F`. |

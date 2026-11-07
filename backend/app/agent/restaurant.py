@@ -1,8 +1,8 @@
 """The restaurant the assistant answers for.
 
-Until Milestone 6 the profile is the fictional demo restaurant below. Milestone 6
-loads it from the `restaurants`, `restaurant_hours` and `assistant_settings`
-tables, and the Settings screen (Milestone 7) edits it.
+Loaded per call from the database (`app.db.restaurants`): the `restaurants`,
+`restaurant_hours` and `assistant_settings` tables. `DEMO_RESTAURANT` mirrors
+`supabase/seed.sql`; it is used by tests and when no database is configured.
 """
 
 from datetime import datetime, time
@@ -34,10 +34,16 @@ class ReservationRules(BaseModel):
     last_seating_minutes_before_close: int = Field(default=60, ge=0)
     # Bookings must start at least this far in the future.
     min_notice_minutes: int = Field(default=30, ge=0)
+    # How long a booking holds its table, and the step between bookable times.
+    dining_duration_minutes: int = Field(default=90, ge=15)
+    slot_interval_minutes: int = Field(default=15, ge=5)
     require_phone: bool = False
 
 
 class RestaurantProfile(BaseModel):
+    # Database id; None for the in-code demo profile.
+    id: str | None = None
+    booking_reference_prefix: str = "RS"
     name: str
     assistant_name: str
     cuisine: str
@@ -51,6 +57,10 @@ class RestaurantProfile(BaseModel):
     services: list[str] = Field(default_factory=list)
     policies: list[str] = Field(default_factory=list)
     rules: ReservationRules = Field(default_factory=ReservationRules)
+    # Assistant settings
+    personality: str = "warm, professional and concise"
+    greeting: str | None = None  # None = built from the restaurant name
+    voice_id: str | None = None  # None = ELEVENLABS_VOICE_ID / default voice
 
     @property
     def tz(self) -> ZoneInfo:
@@ -77,6 +87,7 @@ _WEEKEND = OpeningHours(opens=time(12, 0), closes=time(23, 30))
 
 # Fictional restaurant used for the client demo.
 DEMO_RESTAURANT = RestaurantProfile(
+    booking_reference_prefix="OE",
     name="Olive & Ember",
     assistant_name="Sara",
     cuisine="Mediterranean grill",

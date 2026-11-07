@@ -62,10 +62,13 @@ from app.agent.call_control import (
     end_call_tool,
 )
 from app.agent.prompt import build_greeting, build_system_prompt
-from app.agent.reservations import OfflineReservationBackend
-from app.agent.restaurant import DEMO_RESTAURANT
+from app.agent.reservations import OfflineReservationBackend, ReservationBackend
+from app.agent.restaurant import DEMO_RESTAURANT, RestaurantProfile
 from app.agent.tools import ReservationTools
 from app.config import Settings, get_settings
+from app.db import Database
+from app.db.reservations import DB_ERRORS, PostgresReservationBackend
+from app.db.restaurants import RestaurantNotFoundError, load_profile
 from app.services import missing_voice_credentials
 from app.services.llm import create_llm_service
 from app.services.stt import create_stt_service
@@ -89,9 +92,11 @@ IDLE_TIMEOUT_SECS = 300
 #   silent). Measured: words alone delayed barge-in to ~2.3 s (Deepgram interims).
 
 
-async def run_voice_bot(connection: SmallWebRTCConnection, session: VoiceSession) -> None:
+async def run_voice_bot(
+    connection: SmallWebRTCConnection, session: VoiceSession, db: Database | None = None
+) -> None:
     settings = get_settings()
-    profile = DEMO_RESTAURANT
+    profile, backend = await _restaurant_and_backend(db, session)
 
     transport = SmallWebRTCTransport(
         webrtc_connection=connection,
@@ -102,7 +107,7 @@ async def run_voice_bot(connection: SmallWebRTCConnection, session: VoiceSession
         ),
     )
     stt = create_stt_service(settings)
-    tts = create_tts_service(settings)
+    tts = create_tts_service(settings, voice_id=profile.voice_id)
 
     def on_llm_failover(model: str, next_model: str, exc: Exception) -> None:
         session.record_error(
@@ -123,9 +128,7 @@ async def run_voice_bot(connection: SmallWebRTCConnection, session: VoiceSession
         for frame in closing_frames(said_goodbye=text_probe.replied_to_current_turn):
             await llm.push_frame(frame)
 
-    tools = ReservationTools(
-        profile, OfflineReservationBackend(), observer=session.record_tool_call
-    )
+    tools = ReservationTools(profile, backend, observer=session.record_tool_call)
     greeting = build_greeting(profile)
     # The greeting enters the context when it is spoken (see on_client_ready).
     context = LLMContext(messages=[], tools=tools.schema(extra=[end_call_tool(end_call)]))
@@ -251,6 +254,27 @@ async def run_voice_bot(connection: SmallWebRTCConnection, session: VoiceSession
 
     await runner.add_workers(worker)
     await runner.run()
+
+
+async def _restaurant_and_backend(
+    db: Database | None, session: VoiceSession
+) -> tuple[RestaurantProfile, ReservationBackend]:
+    """The restaurant profile and the reservation backend for this call.
+
+    Without a working database the call still runs, using the built-in demo
+    profile and the offline backend, which never reports availability or bookings.
+    """
+    if db is None:
+        return DEMO_RESTAURANT, OfflineReservationBackend()
+    try:
+        async with db.pool.acquire() as conn:
+            profile = await load_profile(conn, db.restaurant_slug)
+    except (RestaurantNotFoundError, *DB_ERRORS) as exc:
+        session.record_error(f"database: {exc}", fatal=False)
+        logger.opt(exception=True).error("Could not load the restaurant; bookings are offline")
+        return DEMO_RESTAURANT, OfflineReservationBackend()
+    session.restaurant_id = profile.id
+    return profile, PostgresReservationBackend(db.pool, profile, session.session_id)
 
 
 def warm_up_voice_stack(settings: Settings) -> None:

@@ -126,6 +126,7 @@ async def test_voice_status_ready_when_configured(client: httpx.AsyncClient) -> 
         "active_sessions": 0,
         "max_sessions": 2,
         "detail": None,
+        "bookings_online": client.app.state.db is not None,  # type: ignore[attr-defined]
     }
 
 

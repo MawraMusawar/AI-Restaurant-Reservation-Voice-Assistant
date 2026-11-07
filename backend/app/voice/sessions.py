@@ -72,6 +72,8 @@ class VoiceSession:
     ready_at: datetime | None = None
     ended_at: datetime | None = None
     status: SessionStatus = "connecting"
+    # The restaurant (database id) the call was for; None without a database.
+    restaurant_id: str | None = None
     # Why the call ended (set when it ends).
     end_reason: EndReason | None = None
     # The error that ended (or prevented) the call, if any.
@@ -142,6 +144,8 @@ class VoiceSession:
 
 
 BotRunner = Callable[[PeerConnection, VoiceSession], Awaitable[None]]
+# Called once a session has finished (e.g. to save the call log).
+SessionListener = Callable[[VoiceSession], Awaitable[None]]
 
 
 class SessionLimitError(Exception):
@@ -155,8 +159,11 @@ class VoiceSessionManager:
         max_concurrent: int,
         connect_timeout_secs: float = 30.0,
         history_size: int = 50,
+        on_finished: SessionListener | None = None,
     ):
         self._bot_runner = bot_runner
+        self._on_finished = on_finished
+        self._listeners: set[asyncio.Task[None]] = set()
         self._max_concurrent = max_concurrent
         self._connect_timeout_secs = connect_timeout_secs
         self._active: dict[str, VoiceSession] = {}
@@ -233,6 +240,10 @@ class VoiceSessionManager:
             self._active.pop(session.session_id, None)
             self._tasks.pop(session.session_id, None)
             self._history.appendleft(session)
+            if self._on_finished is not None:
+                listener = asyncio.create_task(self._notify_finished(session))
+                self._listeners.add(listener)
+                listener.add_done_callback(self._listeners.discard)
             logger.info(
                 "Voice session finished | session_id={} status={} end_reason={} duration_s={} "
                 "max_loop_lag_ms={} loop_stalls={} dropped_audio_secs={}",
@@ -243,6 +254,16 @@ class VoiceSessionManager:
                 session.max_loop_lag_ms,
                 session.loop_stalls,
                 session.dropped_audio_secs,
+            )
+
+    async def _notify_finished(self, session: VoiceSession) -> None:
+        assert self._on_finished is not None
+        try:
+            await self._on_finished(session)
+        except Exception:
+            # A failed call-log write must never affect calls.
+            logger.opt(exception=True).error(
+                "Saving finished session failed | session_id={}", session.session_id
             )
 
     def list_sessions(self) -> list[VoiceSession]:
@@ -257,6 +278,9 @@ class VoiceSessionManager:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
             logger.info("Cancelled {} voice session(s) on shutdown", len(tasks))
+        if self._listeners:
+            # Let call logs of the sessions just ended reach the database.
+            await asyncio.gather(*self._listeners, return_exceptions=True)
 
 
 async def _monitor_loop_lag(session: VoiceSession) -> None:

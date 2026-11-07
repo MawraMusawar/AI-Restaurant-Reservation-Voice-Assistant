@@ -17,14 +17,15 @@ from app.config import Settings
 from app.services import ServiceNotConfiguredError, has_secret
 
 
-def create_tts_service(settings: Settings) -> ElevenLabsTTSService:
+def create_tts_service(settings: Settings, voice_id: str | None = None) -> ElevenLabsTTSService:
+    """`voice_id` overrides ELEVENLABS_VOICE_ID (e.g. from assistant_settings)."""
     if not has_secret(settings.elevenlabs_api_key):
         raise ServiceNotConfiguredError("ELEVENLABS_API_KEY is not set")
     assert settings.elevenlabs_api_key is not None
     return ElevenLabsTTSService(
         api_key=settings.elevenlabs_api_key.get_secret_value(),
         settings=ElevenLabsTTSService.Settings(
-            voice=settings.elevenlabs_voice,
+            voice=voice_id or settings.elevenlabs_voice,
             model=settings.elevenlabs_model,
         ),
     )

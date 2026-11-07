@@ -80,9 +80,13 @@ class Settings(BaseSettings):
     elevenlabs_model: str = "eleven_flash_v2_5"
 
     # --- Database (Milestone 6) ---
-    supabase_url: str | None = None
-    supabase_service_role_key: SecretStr | None = None
+    # Postgres connection string (Supabase: Connect -> Session pooler URI). The backend
+    # talks to Postgres directly; no Supabase REST keys are needed.
     database_url: SecretStr | None = None
+    db_pool_max_size: int = Field(default=5, ge=1, le=20)
+    db_command_timeout_secs: float = Field(default=10.0, gt=0)
+    # The restaurant this deployment answers for (restaurants.slug).
+    restaurant_slug: str = "olive-and-ember"
 
     @property
     def elevenlabs_voice(self) -> str:

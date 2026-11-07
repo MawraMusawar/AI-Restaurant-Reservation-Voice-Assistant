@@ -44,6 +44,14 @@ def get_voice_services(request: Request) -> VoiceServices:
 
 
 VoiceDep = Annotated[VoiceServices, Depends(get_voice_services)]
+
+
+def bookings_online(request: Request) -> bool:
+    """Whether the reservation database is connected (else bookings are offline)."""
+    return getattr(request.app.state, "db", None) is not None
+
+
+BookingsOnlineDep = Annotated[bool, Depends(bookings_online)]
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 
 BUSY_DETAIL = "All voice lines are busy right now. Please try again in a moment."
@@ -172,13 +180,17 @@ class VoiceStatusOut(BaseModel):
     active_sessions: int
     max_sessions: int
     detail: str | None
+    # False: calls work, but the assistant can't check availability or book.
+    bookings_online: bool
 
 
 # --- Endpoints ----------------------------------------------------------------
 
 
 @router.get("/voice/status", response_model=VoiceStatusOut)
-async def voice_status(voice: VoiceDep, settings: SettingsDep) -> VoiceStatusOut:
+async def voice_status(
+    voice: VoiceDep, settings: SettingsDep, online: BookingsOnlineDep
+) -> VoiceStatusOut:
     """Whether a call can start right now. The call screen checks this before connecting."""
     missing = missing_voice_credentials(settings)
     has_capacity = voice.sessions.has_capacity()
@@ -193,6 +205,7 @@ async def voice_status(voice: VoiceDep, settings: SettingsDep) -> VoiceStatusOut
         active_sessions=voice.sessions.active_count,
         max_sessions=voice.sessions.max_concurrent,
         detail=detail,
+        bookings_online=online,
     )
 
 

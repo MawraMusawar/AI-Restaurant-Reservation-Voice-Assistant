@@ -38,7 +38,7 @@ from pipecat.workers.runner import WorkerRunner
 from app.agent.call_control import end_call_tool
 from app.agent.prompt import build_greeting, build_system_prompt
 from app.agent.reservations import ReservationBackend
-from app.agent.restaurant import DEMO_RESTAURANT
+from app.agent.restaurant import DEMO_RESTAURANT, RestaurantProfile
 from app.agent.tools import ReservationTools
 from app.config import Settings
 from app.services.llm import create_llm_service
@@ -83,13 +83,18 @@ class _ResponseWatcher(FrameProcessor):
 
 
 class TextConversation:
-    def __init__(self, settings: Settings, backend: ReservationBackend, now: datetime) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        backend: ReservationBackend,
+        now: datetime,
+        profile: RestaurantProfile = DEMO_RESTAURANT,
+    ) -> None:
         self.tool_calls: list[ToolCall] = []
         self.failovers: list[str] = []
         self.ended = False  # the assistant called end_call
         self._texts: list[str] = []
         self._rate_limited = False
-        profile = DEMO_RESTAURANT
         tools = ReservationTools(profile, backend, observer=self._on_tool, clock=lambda: now)
         self.context = LLMContext(
             messages=[{"role": "assistant", "content": build_greeting(profile)}],

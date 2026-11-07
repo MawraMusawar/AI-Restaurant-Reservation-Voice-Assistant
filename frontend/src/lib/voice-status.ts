@@ -5,6 +5,8 @@ export type VoiceStatus = {
   active_sessions: number;
   max_sessions: number;
   detail: string | null;
+  /** False: calls work, but the assistant can't check availability or book (no database). */
+  bookings_online: boolean;
 };
 
 /** Ask the backend whether a call can start right now (credentials configured, a line free). */

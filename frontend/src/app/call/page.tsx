@@ -17,9 +17,9 @@ export default function CallPage() {
         </Link>
       </header>
       <p className="text-sm text-zinc-600 dark:text-zinc-400">
-        <strong>Milestone 5: a natural conversation.</strong> Start a call and talk to the
-        receptionist. Interrupt it any time; say goodbye and it hangs up. Bookings are connected to
-        the database in Milestone 6.
+        <strong>Milestone 6: real bookings.</strong> Start a call and book a table: availability
+        is checked in the database and confirmed bookings get a reference. Interrupt any time; say
+        goodbye and the assistant hangs up.
       </p>
       <CallScreen />
     </main>

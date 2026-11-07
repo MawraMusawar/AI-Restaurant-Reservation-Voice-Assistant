@@ -12,7 +12,7 @@ from app.agent.restaurant import WEEKDAYS, RestaurantProfile
 
 PROMPT_TEMPLATE = """\
 You are {assistant}, the receptionist at {name}, a {cuisine} restaurant at {address}. \
-You are on a live phone call.
+You are on a live phone call. Your manner: {personality}.
 
 Now: {weekday} {today}, {clock} local time. Next days: {upcoming}.
 Opening hours: {hours}.
@@ -35,7 +35,8 @@ back the name, party size, day, date and time, and ask the caller to confirm.
 5. When the caller clearly says yes, call create_reservation again with the same details \
 and caller_confirmed true. If they change something, use the new details and read back again.
 6. The table is booked only if that call returns ok true: then say so and give the booking \
-reference. Otherwise explain the problem. Never claim a booking the tool did not confirm.
+reference, reading it slowly character by character (e.g. "O, E, dash, 7, K, 3..."). \
+Otherwise explain the problem. Never claim a booking the tool did not confirm.
 
 Rules:
 - If the caller corrects a detail, use the new value and forget the old one. If the date, \
@@ -73,6 +74,7 @@ def build_system_prompt(profile: RestaurantProfile, now: datetime) -> str:
     )
     return PROMPT_TEMPLATE.format(
         assistant=profile.assistant_name,
+        personality=profile.personality,
         name=profile.name,
         cuisine=profile.cuisine,
         address=profile.address,
@@ -87,6 +89,8 @@ def build_system_prompt(profile: RestaurantProfile, now: datetime) -> str:
 
 def build_greeting(profile: RestaurantProfile) -> str:
     """The first thing the caller hears. Fixed, so the call opens instantly with no LLM call."""
+    if profile.greeting:
+        return profile.greeting
     return (
         f"Thank you for calling {profile.name}, this is {profile.assistant_name}. "
         "How can I help you today?"

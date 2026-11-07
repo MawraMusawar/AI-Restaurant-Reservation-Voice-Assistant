@@ -98,6 +98,7 @@ function CallPanel() {
   const [notice, setNotice] = useState<string | null>(null);
   // Why the assistant hung up; kept after the call so the caller sees it.
   const [endedMessage, setEndedMessage] = useState<string | null>(null);
+  const [bookingsOffline, setBookingsOffline] = useState(false);
   const [localLevel, setLocalLevel] = useState(0);
   // RemoteAudioLevel never fires with SmallWebRTC, so measure the bot's track directly.
   const botAudioTrack = usePipecatClientMediaTrack("audio", "bot");
@@ -171,6 +172,7 @@ function CallPanel() {
         setError(status.detail ?? "The voice assistant is not available right now.");
         return;
       }
+      setBookingsOffline(!status.bookings_online);
       await client.connect({ webrtcRequestParams: { endpoint: OFFER_ENDPOINT } });
     } catch (err) {
       setError(await describeConnectError(err));
@@ -230,6 +232,13 @@ function CallPanel() {
         <StatusItem label="Connection" value={transportState} />
         <StatusItem label="Microphone" value={isMicEnabled ? "On" : "Muted"} />
       </dl>
+
+      {bookingsOffline && (
+        <p role="status" className="mt-6 rounded-xl bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:bg-amber-950 dark:text-amber-200">
+          Bookings are offline: the reservation database isn&apos;t connected. The assistant can
+          answer questions but can&apos;t check availability or book.
+        </p>
+      )}
 
       {notice && (
         <p role="status" className="mt-6 rounded-xl bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:bg-amber-950 dark:text-amber-200">
