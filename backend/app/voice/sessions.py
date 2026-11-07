@@ -83,6 +83,8 @@ class VoiceSession:
     transcript: list[TranscriptEntry] = field(default_factory=list)
     # Time from VAD end-of-speech to the final transcript, per utterance.
     stt_latencies_ms: list[float] = field(default_factory=list)
+    # Time from VAD end-of-speech to the end of the caller's turn (turn detection), per turn.
+    turn_latencies_ms: list[float] = field(default_factory=list)
     # Time from the end of the caller's turn to the assistant's first word of text,
     # per reply (includes turn detection hand-off, tool calls and LLM time-to-first-token).
     response_latencies_ms: list[float] = field(default_factory=list)

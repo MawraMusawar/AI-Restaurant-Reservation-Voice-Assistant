@@ -81,6 +81,8 @@ function CallPanel({ id }: { id: string }) {
         <Info label="Outcome" value={formatEndReason(data.end_reason)} />
         <Info label="Reply time (heard)" value={metric(m.voice_latencies_ms)} />
         <Info label="Transcription" value={metric(m.stt_latencies_ms)} />
+        <Info label="Turn detection" value={metric(m.turn_latencies_ms)} />
+        <Info label="First word (text)" value={metric(m.response_latencies_ms)} />
         <Info label="Startup" value={m.startup_ms ? `${Math.round(Number(m.startup_ms))} ms` : "-"} />
       </dl>
 

@@ -28,7 +28,7 @@ from loguru import logger
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import EndWorkerFrame, ErrorFrame, TTSSpeakFrame
+from pipecat.frames.frames import EndWorkerFrame, ErrorFrame, LLMRunFrame, TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker, ProcessorUnusablePolicy
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -85,6 +85,8 @@ from app.voice.sessions import VoiceSession
 
 # End the call if nothing happens (no speech, no transcripts) for this long.
 IDLE_TIMEOUT_SECS = 300
+# A graceful hang-up (goodbye + service disconnects) normally takes ~5 s; force it after this.
+ENDING_GRACE_SECS = 20.0
 # Barge-in (settings.voice_vad_start_secs / voice_barge_in_min_words): the caller's
 # turn, and so an interruption, starts on whichever comes first:
 # - VAD: that much continuous voice;
@@ -121,8 +123,29 @@ async def run_voice_bot(
         on_failover=on_llm_failover,
     )
 
+    retried = {"this_turn": False}
+
+    def retry_turn_once(error: str) -> bool:
+        if "tool call validation failed" not in error or retried["this_turn"]:
+            return False
+        retried["this_turn"] = True
+        return True
+
+    # Set once we start ending the call gracefully (goodbye, then EndWorkerFrame).
+    ending: dict[str, asyncio.TimerHandle | None] = {"watchdog": None}
+
+    def begin_ending() -> None:
+        """A graceful end takes a few seconds (the goodbye plays, then Deepgram, ElevenLabs
+        and WebRTC disconnect). Cancel only if it hasn't finished in ENDING_GRACE_SECS."""
+        if ending["watchdog"] is None:
+            ending["watchdog"] = asyncio.get_running_loop().call_later(
+                ENDING_GRACE_SECS,
+                lambda: asyncio.ensure_future(runner.cancel(reason="graceful end timed out")),
+            )
+
     async def end_call() -> None:
         # Pushed behind the goodbye already queued for speech, so it is heard first.
+        begin_ending()
         session.end_reason = "assistant_ended"
         await worker.rtvi.send_server_message({"type": "call-ending", "reason": "assistant_ended"})
         for frame in closing_frames(said_goodbye=text_probe.replied_to_current_turn):
@@ -148,7 +171,7 @@ async def run_voice_bot(
             transport.input(),
             LiveEdgeAudioGate(session=session),
             stt,
-            SessionRecorder(session),
+            SessionRecorder(session, turn_clock),
             user_aggregator,
             llm,
             text_probe,
@@ -187,6 +210,12 @@ async def run_voice_bot(
             source,
             frame.error,
         )
+        if not fatal and frame.processor is llm and retry_turn_once(str(frame.error)):
+            # The model named a tool that doesn't exist (Groq rejects it mid-stream). A
+            # second attempt almost always works, so retry quietly before apologising.
+            logger.warning("LLM tool call rejected; retrying the turn once")
+            await worker.queue_frames([LLMRunFrame()])
+            return
         if not fatal and frame.processor is llm:
             # Don't leave the caller in silence: apologise out loud (no LLM needed).
             await worker.queue_frames([TTSSpeakFrame(LLM_TROUBLE_REPLY)])
@@ -219,6 +248,7 @@ async def run_voice_bot(
         frames = [TTSSpeakFrame(text)]
         if hang_up:
             session.end_reason = "caller_silent"
+            begin_ending()
             await worker.rtvi.send_server_message(
                 {"type": "call-ending", "reason": "caller_silent"}
             )
@@ -227,8 +257,10 @@ async def run_voice_bot(
 
     @user_aggregator.event_handler("on_user_turn_stopped")
     async def on_user_turn_stopped(_aggregator, _strategy, message: UserTurnStoppedMessage) -> None:
+        retried["this_turn"] = False
         if message.content:
-            turn_clock.mark_user_turn_end()
+            if (detect_ms := turn_clock.mark_user_turn_end()) is not None:
+                session.turn_latencies_ms.append(detect_ms)
             session.add_transcript("user", message.content)
             logger.debug("Caller turn: {!r}", message.content)
 
@@ -248,12 +280,20 @@ async def run_voice_bot(
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(_transport, _connection) -> None:
         logger.info("Client disconnected | session_id={}", session.session_id)
+        if ending["watchdog"] is not None:
+            # We are already ending the call. Cancelling now raced with the graceful
+            # shutdown and could leave the session hanging (call log never saved).
+            return
         if session.end_reason is None:
             session.end_reason = "caller_hung_up"
         await runner.cancel(reason="client disconnected")
 
     await runner.add_workers(worker)
-    await runner.run()
+    try:
+        await runner.run()
+    finally:
+        if ending["watchdog"] is not None:
+            ending["watchdog"].cancel()
 
 
 async def _restaurant_and_backend(

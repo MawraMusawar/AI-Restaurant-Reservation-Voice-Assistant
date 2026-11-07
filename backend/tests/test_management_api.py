@@ -123,9 +123,13 @@ async def test_staff_create_list_and_cancel_reservations(admin: httpx.AsyncClien
     assert found and found[0]["booking_reference"] == reference
 
     # Fill the other table, then the slot is full: 409 with alternatives.
-    second = await admin.post("/api/reservations", json={**body, "customer_name": "Two"})
+    second = await admin.post(
+        "/api/reservations", json={**body, "customer_name": "Two", "phone": "03007654321"}
+    )
     assert second.status_code == 201 and second.json()["table"] == "T4"
-    full = await admin.post("/api/reservations", json={**body, "customer_name": "Three"})
+    full = await admin.post(
+        "/api/reservations", json={**body, "customer_name": "Three", "phone": None}
+    )
     assert full.status_code == 409, full.text
     assert full.json()["detail"]["code"] == "slot_unavailable"
     assert full.json()["detail"]["alternatives"]
@@ -239,3 +243,15 @@ async def test_call_logs_list_and_detail(admin: httpx.AsyncClient, restaurant: s
     finally:
         async with database.pool.acquire() as conn:
             await conn.execute("delete from voice_sessions where id = $1", session.session_id)
+
+
+@needs_db
+@pytest.mark.integration
+async def test_double_submitted_staff_booking_is_not_duplicated(admin: httpx.AsyncClient) -> None:
+    body = {"customer_name": "Hina", "phone": "03001234567", "date": future_day(),
+            "time": "20:00", "guests": 2}  # fmt: skip
+    first = await admin.post("/api/reservations", json=body)
+    again = await admin.post("/api/reservations", json=body)
+    assert first.status_code == 201
+    assert again.status_code == 409 and again.json()["detail"]["code"] == "already_booked"
+    assert first.json()["booking_reference"] in again.json()["detail"]["detail"]

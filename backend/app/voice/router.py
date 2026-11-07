@@ -131,6 +131,7 @@ class VoiceSessionOut(BaseModel):
     errors: list[str]
     transcript: list[TranscriptEntryOut]
     stt_latencies_ms: list[float]
+    turn_latencies_ms: list[float]
     response_latencies_ms: list[float]
     voice_latencies_ms: list[float]
     dropped_audio_secs: float
@@ -157,6 +158,7 @@ class VoiceSessionOut(BaseModel):
                 for t in s.transcript
             ],
             stt_latencies_ms=list(s.stt_latencies_ms),
+            turn_latencies_ms=list(s.turn_latencies_ms),
             response_latencies_ms=list(s.response_latencies_ms),
             voice_latencies_ms=list(s.voice_latencies_ms),
             dropped_audio_secs=s.dropped_audio_secs,

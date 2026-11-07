@@ -19,6 +19,7 @@ from app.agent.booking_rules import BookingSlot
 from app.agent.reservations import NewReservation, OfflineReservationBackend
 from app.agent.restaurant import DEMO_RESTAURANT
 from app.config import get_settings
+from app.db.reservations import DATABASE_ERROR
 from tests.agent_harness import TextConversation
 
 pytestmark = [
@@ -149,3 +150,64 @@ async def test_goodbye_ends_the_call() -> None:
         assert conv.ended, f"the assistant did not hang up: {reply}"
         # If the model hangs up without words, the pipeline speaks FALLBACK_GOODBYE
         # (tested in test_call_control.py), so the line never just goes dead.
+
+
+class FailingBackend(ScriptedBackend):
+    """The database is down: every operation fails like PostgresReservationBackend does."""
+
+    async def check_availability(self, slot: BookingSlot) -> dict[str, Any]:
+        return dict(DATABASE_ERROR)
+
+    async def create_reservation(self, reservation: NewReservation) -> dict[str, Any]:
+        return await self.check_availability(reservation.slot)  # type: ignore[return-value]
+
+
+async def test_database_failure_is_explained_never_booked() -> None:
+    backend = FailingBackend()
+    async with TextConversation(get_settings(), backend, NOW) as conv:
+        reply = await conv.say("A table for two tomorrow at 8 PM, please.")
+        text = reply.text.lower()
+        assert "check_availability" in _names(reply), reply
+        assert any(w in text for w in ("sorry", "apolog", "problem", "trouble", "unable")), reply
+        assert "booked" not in text.replace("not booked", "").replace("nothing was booked", "")
+        assert backend.created == []
+
+
+async def test_invalid_requests_are_explained() -> None:
+    async with TextConversation(get_settings(), ScriptedBackend(), NOW) as conv:
+        big = await conv.say("I need a table for 14 people on Saturday at 8 PM.")
+        assert any(w in big.text.lower() for w in ("10", "ten", "email")), big
+        past = await conv.say("Actually, make it 2 people, yesterday at 8 PM.")
+        assert any(w in past.text.lower() for w in ("passed", "past", "already", "yesterday")), past
+
+
+async def test_long_call_stays_responsive() -> None:
+    """A long, meandering call: replies keep coming, context stays within the budget."""
+    turns = [
+        "Hi there.",
+        "Where are you located?",
+        "Do you have vegetarian options?",
+        "What time do you close on Friday?",
+        "Okay, I'd like a table for three on Friday at 8 PM.",
+        "Actually, make that four people.",
+        "The name is Omar Farooq.",
+        "Yes, that's right.",
+        "Is parking available?",
+        "Can I bring a child? Do you have high chairs?",
+        "Great, thanks. That's all, goodbye!",
+    ]
+    backend = ScriptedBackend()
+    latencies = []
+    async with TextConversation(get_settings(), backend, NOW) as conv:
+        for line in turns:
+            reply = await conv.say(line)
+            assert reply.text.strip() or conv.ended, f"no reply to {line!r}"
+            latencies.append(reply.latency_ms)
+        context_chars = sum(len(str(m)) for m in conv.context.get_messages())
+    print(f"\n[long call] reply ms={latencies} context_chars={context_chars} "
+          f"failovers={len(conv.failovers)}")  # fmt: skip
+    assert len(backend.created) == 1 and backend.created[0].slot.guests == 4
+    assert conv.ended, "the assistant should hang up after the goodbye"
+    # ~11 turns with tool results: still far below a request size that would strain the
+    # free tier (system prompt + tools are ~5K chars on top).
+    assert context_chars < 20_000, context_chars

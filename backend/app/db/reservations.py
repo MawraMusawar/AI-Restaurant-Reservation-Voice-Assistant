@@ -178,8 +178,13 @@ class PostgresReservationBackend:
         start, end = booking_period(self._profile, slot)
         booked: asyncpg.Record | None = None
         alternatives: list[dict[str, str]] = []
+        duplicate: asyncpg.Record | None = None
 
         async with self._pool.acquire() as conn, conn.transaction():
+            duplicate = await self._find_duplicate(conn, reservation, start, end)
+            if duplicate is not None:
+                # Nothing written: the caller (or a double-submitted form) already has it.
+                return self._already_booked(duplicate)
             customer_id = await self._upsert_customer(conn, reservation)
             tables, bookings = await self._day_state(conn, slot)
             for table in free_tables(tables, bookings, slot.guests, start, end):
@@ -207,6 +212,50 @@ class PostgresReservationBackend:
             self._session_id,
         )
         return {"ok": True, "status": "confirmed", **self._describe(booked)}
+
+    async def _find_duplicate(
+        self, conn: asyncpg.Connection, r: NewReservation, start: datetime, end: datetime
+    ) -> asyncpg.Record | None:
+        """An existing confirmed booking that this request would duplicate.
+
+        Same phone and overlapping time; or, without a phone, the same name, start
+        time and party size (strict, so two different people called Ali can both book).
+        """
+        return await conn.fetchrow(
+            """
+            select r.*, c.name as customer_name, t.area
+            from reservations r
+            join customers c on c.id = r.customer_id
+            join restaurant_tables t on t.id = r.table_id
+            where r.restaurant_id = $1 and r.status = 'confirmed'
+              and r.starts_at < $3 and r.ends_at > $2
+              and (
+                ($4::text is not null and c.phone = $4)
+                or (lower(c.name) = lower($5) and r.starts_at = $2 and r.party_size = $6)
+              )
+            order by r.created_at limit 1
+            """,
+            self._restaurant_id,
+            start,
+            end,
+            r.phone,
+            r.customer_name,
+            r.slot.guests,
+        )
+
+    def _already_booked(self, row: asyncpg.Record) -> Result:
+        booking = self._describe(row)
+        logger.info("Duplicate booking request | existing={}", booking["booking_reference"])
+        return {
+            "ok": False,
+            "error_code": "already_booked",
+            "message": (
+                f"This caller already has this booking (reference "
+                f"{booking['booking_reference']}), so nothing new was booked. Tell them it is "
+                "already confirmed and give the reference; do not book again."
+            ),
+            "existing_booking": booking,
+        }
 
     async def _upsert_customer(self, conn: asyncpg.Connection, r: NewReservation) -> Any:
         if r.phone:

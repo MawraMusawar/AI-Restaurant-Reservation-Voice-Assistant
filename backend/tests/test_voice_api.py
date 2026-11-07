@@ -284,8 +284,21 @@ needs_deepgram = pytest.mark.skipif(
         ("correction_fast.wav", None, [["six thirty", "6:30", "630"], ["sarah"]]),
         ("question_slow.wav", None, [["close"], ["sunday"]]),
         ("booking_normal.wav", 5.0, [["table"], ["four", "4"]]),  # noisy room, SNR 5 dB
+        # Accents (ElevenLabs voices; see fixtures/generate_accent_fixtures.py)
+        *[
+            (f"accent_{who}.wav", None, [["table"], ["four", "4"], ["7:30", "seven thirty", "730"]])
+            for who in ("british_male", "british_female", "australian_male")
+        ],
     ],
-    ids=["normal-speech", "fast-speech", "slow-speech", "background-noise-5dB"],
+    ids=[
+        "normal-speech",
+        "fast-speech",
+        "slow-speech",
+        "background-noise-5dB",
+        "accent-british-male",
+        "accent-british-female",
+        "accent-australian-male",
+    ],
 )
 async def test_live_transcription_over_webrtc(
     client: httpx.AsyncClient,

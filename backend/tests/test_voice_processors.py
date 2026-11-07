@@ -165,3 +165,12 @@ async def test_reply_probe_ignores_output_without_a_caller_turn() -> None:
 
 def _tts_audio() -> TTSAudioRawFrame:
     return TTSAudioRawFrame(audio=b"\x00\x00" * 480, sample_rate=24000, num_channels=1)
+
+
+def test_turn_clock_measures_turn_detection_from_vad_stop() -> None:
+    times = iter([5.0, 5.8, 9.0])
+    clock = TurnClock(clock=lambda: next(times))
+    clock.mark_speech_stopped()  # t=5.0: the VAD heard silence
+    assert clock.mark_user_turn_end() == 800.0  # t=5.8: turn ended 0.8 s later
+    assert clock.mark_user_turn_end() is None  # t=9.0: no speech stop since (e.g. typed)
+    assert clock.turn == 2

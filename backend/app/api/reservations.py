@@ -134,6 +134,10 @@ async def create_reservation(
     if result.get("error_code") == "database_error":
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, result["message"])
     if not result.get("ok"):
+        # slot_unavailable (with alternatives) or already_booked (with the existing booking)
+        if result.get("error_code") == "already_booked":
+            reference = result["existing_booking"]["booking_reference"]
+            result = {**result, "message": f"This customer already has this booking ({reference})."}
         raise _problem(status.HTTP_409_CONFLICT, result)
     row = await conn.fetchrow(
         RESERVATION_SELECT + " where r.booking_reference = $1", result["booking_reference"]

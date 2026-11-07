@@ -30,15 +30,18 @@ def migration_files() -> list[Path]:
 
 
 async def applied_versions(conn: asyncpg.Connection) -> set[str]:
-    await conn.execute(
-        """
-        create table if not exists schema_migrations (
-            version text primary key,
-            applied_at timestamptz not null default now()
+    exists = await conn.fetchval("select to_regclass('public.schema_migrations') is not null")
+    if not exists:
+        # DDL only on first run: ALTER TABLE takes an exclusive lock every time it runs.
+        await conn.execute(
+            """
+            create table schema_migrations (
+                version text primary key,
+                applied_at timestamptz not null default now()
+            );
+            alter table schema_migrations enable row level security;
+            """
         )
-        """
-    )
-    await conn.execute("alter table schema_migrations enable row level security")
     return {r["version"] for r in await conn.fetch("select version from schema_migrations")}
 
 

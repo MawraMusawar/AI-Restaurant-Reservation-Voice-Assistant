@@ -95,9 +95,12 @@ class SessionRecorder(FrameProcessor):
     Place it directly after the STT service. All frames pass through unchanged.
     """
 
-    def __init__(self, session: VoiceSession, **kwargs) -> None:
+    def __init__(
+        self, session: VoiceSession, turn_clock: "TurnClock | None" = None, **kwargs
+    ) -> None:
         super().__init__(**kwargs)
         self._session = session
+        self._turn_clock = turn_clock
         self._speech_stopped_at: float | None = None
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
@@ -114,6 +117,8 @@ class SessionRecorder(FrameProcessor):
             self._speech_stopped_at = None
         elif isinstance(frame, VADUserStoppedSpeakingFrame):
             self._speech_stopped_at = time.monotonic()
+            if self._turn_clock is not None:
+                self._turn_clock.mark_speech_stopped()
         elif isinstance(frame, TranscriptionFrame) and frame.text.strip():
             latency_ms: float | None = None
             if self._speech_stopped_at is not None:
@@ -143,10 +148,22 @@ class TurnClock:
         self.clock = clock
         self.turn = 0
         self.ended_at: float | None = None
+        # When the VAD last heard the caller stop (set by SessionRecorder).
+        self.speech_stopped_at: float | None = None
 
-    def mark_user_turn_end(self) -> None:
+    def mark_speech_stopped(self) -> None:
+        self.speech_stopped_at = self.clock()
+
+    def mark_user_turn_end(self) -> float | None:
+        """Close the caller's turn. Returns the turn-detection time in ms: from the VAD
+        hearing silence to the turn ending (smart-turn + pause window + final transcript)."""
         self.turn += 1
         self.ended_at = self.clock()
+        if self.speech_stopped_at is None:
+            return None
+        detect_ms = round((self.ended_at - self.speech_stopped_at) * 1000, 1)
+        self.speech_stopped_at = None
+        return detect_ms
 
 
 class ReplyLatencyProbe(FrameProcessor):

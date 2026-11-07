@@ -1,0 +1,12 @@
+{
+  "name": "restaurant-voice-e2e",
+  "private": true,
+  "type": "module",
+  "description": "Browser end-to-end tests: real Chrome driving the app (see README.md). Separate from frontend/ so installing it never touches the dev server's node_modules.",
+  "scripts": {
+    "test": "python run.py all"
+  },
+  "dependencies": {
+    "playwright-core": "1.65.0"
+  }
+}

@@ -212,3 +212,30 @@ async def test_call_log_is_saved_with_its_transcript(db: Database, restaurant: s
     finally:
         async with db.pool.acquire() as conn:
             await conn.execute("delete from voice_sessions where id = $1", session.session_id)
+
+
+async def test_repeated_requests_do_not_create_duplicate_bookings(db: Database, restaurant: str):
+    """A caller confirming twice, or a double-submitted form, keeps one booking."""
+    backend = await backend_for(db, restaurant)
+    s = slot(2)
+    first = await backend.create_reservation(booking(s, "Ali Raza", phone="+923001112233"))
+    again = await backend.create_reservation(booking(s, "Ali Raza", phone="+923001112233"))
+    assert first["ok"] is True
+    assert again["ok"] is False and again["error_code"] == "already_booked"
+    assert again["existing_booking"]["booking_reference"] == first["booking_reference"]
+
+    # Without a phone: same name, time and party size is a duplicate...
+    no_phone = await backend.create_reservation(booking(slot(2, time(13, 0)), "Hina"))
+    repeat = await backend.create_reservation(booking(slot(2, time(13, 0)), "hina"))
+    assert no_phone["ok"] and repeat["error_code"] == "already_booked"
+    # ...but a different person at the same time is a new booking.
+    other = await backend.create_reservation(booking(slot(2, time(13, 0)), "Sara"))
+    assert other["ok"] is True
+
+    async with db.pool.acquire() as conn:
+        count = await conn.fetchval(
+            "select count(*) from reservations r join restaurants x on x.id = r.restaurant_id "
+            "where x.slug = $1",
+            restaurant,
+        )
+    assert count == 3

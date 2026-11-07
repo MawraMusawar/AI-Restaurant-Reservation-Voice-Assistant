@@ -18,7 +18,7 @@ A real-time, browser-based AI voice receptionist for restaurants. Callers speak 
 | 5. Complete conversation engine | ✅ Done (turn-taking, silence, goodbye, error recovery; Chrome E2E) |
 | 6. Supabase database + reservation engine | ✅ Done (database tests + real-Groq booking against Supabase; spoken Chrome booking pending a quiet CPU) |
 | 7. Frontend dashboard | ✅ Done (all screens; API tests + 19-check Chrome E2E) |
-| 8. Testing and debugging | ⬜ Not started |
+| 8. Testing and debugging | ✅ Done (spoken booking verified end to end; limitations documented below) |
 | 9. Demo preparation | ⬜ Not started |
 
 ---
@@ -325,6 +325,73 @@ Database errors in these requests become **503** (unavailable), **409** (duplica
 **Tests:**
 - `tests/test_management_api.py`: auth (expiry, forgery, logout, locked without a password) and every endpoint, against the real database in a throwaway restaurant.
 - Browser E2E (Chrome, test servers on 8010/3010, throwaway restaurant, 19 checks): the login redirect and wrong password; the dashboard; a staff booking, a full slot with a one-click alternative, and a cancellation; a call transcript; hours, tables (including duplicate rejection) and assistant settings; the dashboard counts; sign-out; no horizontal scroll at phone width; no console errors.
+
+## Testing and Known Limitations (Milestone 8)
+
+### Test suite
+
+| Suite | How to run | What it covers |
+|---|---|---|
+| Unit (fast, no external services) | `cd backend && uv run pytest -m "not integration"` | Booking rules, availability and table fit, tools (two-step confirmation, validation), turn/latency probes, failover, call control, sessions, auth tokens (~100 tests) |
+| Speech (real Deepgram over WebRTC) | `uv run pytest tests/test_voice_api.py -m integration` | Normal, fast and slow speech, noise at SNR 5 dB, **British male, British female and Australian accents**, silence, a rejected key, barge-in, a one-word backchannel, silence check-in and hang-up, a spoken answer |
+| AI (real Groq) | `uv run pytest tests/test_agent_llm.py tests/test_agent_llm_db.py` | Missing info, relative dates, alternatives, confirmation, corrections, vague times, goodbye, **a database failure mid-booking**, invalid requests (14 people, a past date), **an 11-turn call**, booking and cancelling in the real database |
+| Database (real Supabase) | `uv run pytest tests/test_db_reservations.py tests/test_management_api.py` | Booking, best fit, a full slot with alternatives, **5 concurrent bookings for the last table: exactly 1 wins**, the exclusion constraint on its own, cancellation, **duplicate requests** (repeat confirmation, double-submitted form), database outage, call logs, every management endpoint |
+| Browser E2E (real Chrome) | see [e2e/README.md](e2e/README.md) | All staff screens (19 checks), and **a complete booking made by voice**, verified in the database |
+
+Every database test uses a throwaway restaurant, so the demo data is never touched.
+
+### Measured performance (2026-11-07, quiet CPU, Deepgram EU, real services)
+
+From the spoken-booking E2E (per-stage timings recorded in each call log):
+
+| Stage | Typical | Range seen |
+|---|---|---|
+| Call start → live ("On call") | 2.2-2.4 s | 2.2-2.9 s |
+| Speech-to-text: caller stops → final transcript | **110-160 ms** | 78-344 ms |
+| Turn detection: caller stops → turn ends (smart-turn + 0.4 s pause window) | **~0.6 s** | 0.59-0.69 s |
+| AI: turn end → first word of text | **1.1-2.4 s** | 0.5-3.1 s (Groq free tier; varies with load and failovers) |
+| Voice: first text → first audio (ElevenLabs Flash) | **~0.4-0.55 s** | 0.38-0.6 s |
+| **Total: caller's turn ends → caller hears the reply** | **1.7-2.9 s** | 1.0-3.6 s |
+| Barge-in: caller's first word → assistant stops | 1.15-1.6 s (VAD 0.4 s) | 0.8-0.9 s with `VOICE_VAD_START_SECS=0.2` |
+
+**Groq is the largest and most variable stage.** In the same booking script, the AI's reply took 0.5-1.4 s on some turns and 1.7-3.1 s on others, depending on free-tier load and rate-limit failovers.
+
+**Capacity** (backend process, separate client processes like real browsers):
+
+| Load | CPU (% of one core) | Memory | Audio health |
+|---|---|---|---|
+| Idle | ~0 | 169 MB | - |
+| 1 call | avg 55, peak 100 | 212 MB | 0 s dropped, loop lag ≤ 106 ms |
+| 2 calls (started 4 s apart) | avg ~60, peak 106 | 240 MB | 0 s dropped, loop lag ≤ 90 ms |
+
+**Free quota used by testing:** one spoken-booking E2E costs about 1 minute of Deepgram audio, ~10 Groq requests and **~300-400 ElevenLabs credits**. Milestone 8 testing used about half of the month's 10,000 ElevenLabs credits (reset 7 Dec 2026), so about 4,500 were left, roughly **7 full demo calls**. Check before a demo: https://elevenlabs.io/app/usage
+
+### Bugs found and fixed in Milestone 8
+
+- **The call log could be lost when the assistant hung up.** If the browser disconnected during the ~4.5 s graceful shutdown (goodbye playing, then Deepgram, ElevenLabs and WebRTC closing), a cancel raced the shutdown and the session never finished. Now a disconnect during a graceful end is ignored, and a 20 s watchdog forces the end if it ever stalls.
+- **The AI asked for an optional phone number, then claimed it was required**, and the call stalled. The prompt now says not to ask unless the restaurant requires one.
+- **Duplicate bookings:** a repeated confirmation or a double-submitted staff form created a second reservation. The same phone with an overlapping time, or the same name, time and party size, now returns the existing booking (`already_booked`).
+- **The model sometimes named a tool that doesn't exist** (e.g. `check_arrival`), and Groq rejected the turn mid-stream. The turn is now retried once automatically, before the spoken apology.
+- **Turn detection wasn't measured.** Each call now records it, alongside STT, AI and voice timings.
+
+### Known limitations
+
+**Voice and audio**
+- **CPU starvation breaks real-time audio.** If another program keeps the CPU at 100%, the backend's audio loop stalls (up to 1.5-2 s measured), caller audio is dropped and transcripts are garbled. Run the demo on an otherwise idle computer; `dropped_audio_secs` and `loop_stalls` in the call log show when this happened.
+- **Two calls starting in the same second:** one of them may fail to connect (its WebRTC/ICE negotiation stays "checking"), and that caller sees a connection error after 30 s; retrying works. Calls started a few seconds apart work fine, and two concurrent calls ran with healthy audio. The cause is in the WebRTC library layer, not the app.
+- **Barge-in takes 1.15-1.6 s** when the caller opens with a short word and a pause, the price of ignoring "okay"/"mm-hmm" and speaker echo. In about 1 of 8 barge-ins the audio stopped but the transcript didn't mark the reply as interrupted.
+- **Turns can still split** when the caller pauses longer than 0.4 s between sentences. Each fragment is answered, and the assistant is interrupted by the next one.
+- **Accents:** British and Australian English were transcribed perfectly; South Asian accents haven't been tested with recordings (no such voices are available on the free tier). `DEEPGRAM_LANGUAGE=en-IN` is available.
+- **Words spoken before "On call" are dropped** (by design: stale audio would otherwise delay the whole call).
+
+**AI**
+- **Reply time is dominated by Groq's free tier:** 0.5-3 s for the first word, about 8K tokens per minute per model. A fast-paced call can trigger failover to `qwen3.8-27b`, which is good but slightly less disciplined; code guards (two-step booking, fallback goodbye, tool-call retry) cover the issues seen.
+- Names are stored as speech recognition heard them (e.g. "Sara" became "Sarah"); the read-back lets the caller correct it.
+
+**Data and operations**
+- **Database round trip is ~250 ms** (Pakistan → Supabase Singapore pooler), so each booking takes several round trips (~1-2 s). Database tests occasionally hit the 10 s command timeout on the free pooler; rerunning passes.
+- Opening hours that run past midnight aren't supported.
+- **Free quotas** (Deepgram, Groq, ElevenLabs) limit how many calls and test runs are possible. They are documented above, and quota exhaustion is reported clearly, never silently switched to a paid tier.
 
 ## Running Everything Locally
 

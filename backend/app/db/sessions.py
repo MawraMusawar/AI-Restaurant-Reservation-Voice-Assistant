@@ -13,6 +13,7 @@ def session_metrics(session: VoiceSession) -> dict:
         "startup_ms": session.startup_ms,
         "duration_seconds": session.duration_seconds,
         "stt_latencies_ms": session.stt_latencies_ms,
+        "turn_latencies_ms": session.turn_latencies_ms,
         "response_latencies_ms": session.response_latencies_ms,
         "voice_latencies_ms": session.voice_latencies_ms,
         "dropped_audio_secs": session.dropped_audio_secs,

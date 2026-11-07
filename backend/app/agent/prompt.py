@@ -67,10 +67,13 @@ def build_system_prompt(profile: RestaurantProfile, now: datetime) -> str:
         f"{WEEKDAYS[d.weekday()][:3]} {d.isoformat()}"
         for d in (today + timedelta(days=offset) for offset in range(1, 8))
     )
+    # "Optional; take it if offered" made the model ask for a phone anyway, then claim
+    # it was required (seen in the Milestone 8 voice E2E). Say plainly not to ask.
     phone_step = (
         " and a phone number"
         if profile.rules.require_phone
-        else ". A phone number is optional; take it if offered"
+        else ". Do not ask for a phone number (it isn't needed); include one only if the "
+        "caller gives it"
     )
     return PROMPT_TEMPLATE.format(
         assistant=profile.assistant_name,
