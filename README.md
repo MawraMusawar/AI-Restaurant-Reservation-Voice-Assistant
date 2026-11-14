@@ -16,10 +16,10 @@ A real-time, browser-based AI voice receptionist for restaurants. Callers speak 
 | 3. Groq LLM + tool calling | ✅ Done (real Groq conversation tests + Chrome E2E) |
 | 4. ElevenLabs TTS | ✅ Done (spoken replies, barge-in) |
 | 5. Complete conversation engine | ✅ Done (turn-taking, silence, goodbye, error recovery; Chrome E2E) |
-| 6. Supabase database + reservation engine | ✅ Done (database tests + real-Groq booking against Supabase; spoken Chrome booking pending a quiet CPU) |
+| 6. Supabase database + reservation engine | ✅ Done (database tests + real-Groq booking against Supabase; spoken booking verified in Milestone 8) |
 | 7. Frontend dashboard | ✅ Done (all screens; API tests + 19-check Chrome E2E) |
 | 8. Testing and debugging | ✅ Done (spoken booking verified end to end; limitations documented below) |
-| 9. Demo preparation | ⬜ Not started |
+| 9. Demo preparation | ✅ Done (sample data, quota check, one-command start, secret scan, [DEMO.md](DEMO.md)) |
 
 ---
 
@@ -48,6 +48,9 @@ API accounts (all on free tiers; needed in later milestones):
 .
 ├── CLAUDE.md              # Project requirements and engineering rules
 ├── README.md
+├── DEMO.md                # Client demo guide: checklist, demo flow, example conversations
+├── start-demo.ps1         # One command: pre-flight checks, then backend + frontend
+├── e2e/                   # Browser end-to-end tests (Playwright + real Chrome)
 ├── backend/               # FastAPI + Pipecat voice agent (Python 3.12, uv)
 │   ├── app/
 │   │   ├── main.py        # FastAPI app factory and lifespan
@@ -57,7 +60,8 @@ API accounts (all on free tiers; needed in later milestones):
 │   │   ├── voice/         # Signaling, session lifecycle, the Pipecat pipeline, processors
 │   │   ├── services/      # One module per provider: stt.py (Deepgram), llm.py (Groq), tts.py (ElevenLabs)
 │   │   ├── agent/         # Conversation logic: restaurant profile, booking rules, availability, prompt, tools
-│   │   └── db/            # PostgreSQL: pool, migration runner, restaurant/reservation/call-log repositories
+│   │   ├── db/            # PostgreSQL: pool, migration runner, repositories, demo_data.py (sample bookings)
+│   │   └── quota.py       # Free-tier quota check (ElevenLabs, Groq, Deepgram)
 │   ├── tests/
 │   ├── pyproject.toml
 │   └── .env.example
@@ -393,9 +397,31 @@ From the spoken-booking E2E (per-stage timings recorded in each call log):
 - Opening hours that run past midnight aren't supported.
 - **Free quotas** (Deepgram, Groq, ElevenLabs) limit how many calls and test runs are possible. They are documented above, and quota exhaustion is reported clearly, never silently switched to a paid tier.
 
+## Demo Preparation (Milestone 9)
+
+**Full guide: [DEMO.md](DEMO.md)** (checklist, demo flow, example conversations, what to do if something goes wrong).
+
+```powershell
+.\start-demo.ps1 -RefreshSamples   # checks CPU + quotas, re-dates the samples, starts both servers, opens the app
+```
+
+| Tool | Command (in `backend/`) | What it does |
+|---|---|---|
+| Sample bookings | `uv run python -m app.db.demo_data` | 12 sample reservations for Olive & Ember dated from today (some today, the rest over the next week; 2 cancelled), checked against the real booking rules and tables. Re-running refreshes them; `--remove` deletes them. They use references `OE-DEMO01`..`OE-DEMO12`, which real bookings can't have (no `0`/`O`/`1` in real references), so real data is never touched. Marked "via admin": no call logs are invented. One sample takes the only 10-seat table, giving a reliable "fully booked → alternatives" scenario (the script prints which day and time). |
+| Clear test calls | `uv run python -m app.db.demo_data --clear-call-logs` | Deletes **all** call logs of the demo restaurant (e.g. development test calls) so the dashboard starts clean. Bookings are kept. Irreversible. |
+| Quota check | `uv run python -m app.quota` | ElevenLabs credits left and the reset date, Groq requests left today and tokens left this minute per model (one tiny request each), Deepgram balance if the key may read it. Exits non-zero if something is low. Keys are never printed. |
+
+`start-demo.ps1` starts the frontend as a production build (1-2 min; instant page loads, no dev overlay; `-Dev` for the dev server) and the backend without `--reload`, so saving a file mid-demo can't restart it. It reads the backend port from `frontend/.env.local` and reports whether voice and bookings are ready.
+
+**Checked on 2026-11-14:**
+- **Secrets:** no real key, password or `DATABASE_URL` appears in any commit (all branches), tracked file or the frontend build output; no `.env` file was ever committed (only the `.env.example` files); the frontend has no `NEXT_PUBLIC_` variables. The only URL-with-password strings are placeholders and the fake ones in a unit test.
+- **Quotas:** ElevenLabs 3,710 of 10,000 credits (about 10 demo calls; resets 7 Dec), Groq 998/1,000 requests left on both models, Deepgram key valid.
+- **Start script:** both servers up, "voice ready, bookings online"; the dashboard and reservations show the samples in Chrome with no console errors.
+- **Tests:** `tests/test_demo_data.py` (in a throwaway restaurant): samples are valid, refreshable and removable without touching a real booking or customer; clearing call logs only affects that restaurant.
+
 ## Running Everything Locally
 
-Use two terminals:
+For a demo, use `.\start-demo.ps1` (above). For development, use two terminals:
 
 | Terminal | Command | URL |
 |---|---|---|
@@ -425,7 +451,8 @@ Use two terminals:
 | `node` not found after installing Node.js | Restart VS Code or the terminal so the new PATH is loaded. |
 | `EPERM: operation not permitted, rename ...` (Next.js), ruff/uv "Access is denied" | The drive's permissions let normal users create files but not rename or delete them. Grant yourself Modify on the project folder (no admin needed, since you own it): `icacls "D:\Agentic Voice-AI" /grant "${env:USERNAME}:(OI)(CI)M"`, then restart `npm run dev`. |
 | Transcripts garbled, slow replies, `dropped_audio_secs` > 0 or `loop_stalls` > 0 in `/api/voice/sessions` | The computer's CPU is overloaded (another heavy program), so the real-time audio loop falls behind. Close heavy programs (check Task Manager) and retry. |
-| "The ElevenLabs free voice credits are used up" | The monthly 10,000 credits are spent; they reset monthly. Check https://elevenlabs.io/app/usage |
+| "The ElevenLabs free voice credits are used up" | The monthly 10,000 credits are spent; they reset monthly. Check with `uv run python -m app.quota` or https://elevenlabs.io/app/usage |
+| `start-demo.ps1` "cannot be loaded because running scripts is disabled" | Run `powershell -ExecutionPolicy Bypass -File .\start-demo.ps1` |
 | `uv run ...`: "Failed to spawn: uvicorn" | Run it from the `backend` folder; the environment lives there. |
 | "Bookings are offline" on the call page | `DATABASE_URL` is missing or the database is unreachable (see the backend log). Use the **Session pooler** URI (the direct host is IPv6-only), then run `uv run python -m app.db.migrate --seed` and restart the backend. |
 | `getaddrinfo failed` connecting to the database | Usually a password with `@` read as part of the host; the backend now encodes it. Otherwise check the host in `DATABASE_URL`. |
